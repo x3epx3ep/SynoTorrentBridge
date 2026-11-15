@@ -116,6 +116,7 @@ def default_tasks():
 
 class MockNAS(BaseHTTPRequestHandler):
     captured = {}
+    task_status = {}          # id -> статус для Task get
     tasks = default_tasks()
     dirs = {"/downloads", "/video", "/video/films"}
 
@@ -201,6 +202,11 @@ class MockNAS(BaseHTTPRequestHandler):
                 {"id": 2, "name": "Test Razdacha 2024/readme.txt", "size": 100, "priority": "normal"}]}})
         elif api == "SYNO.DownloadStation2.Task" and method == "list":
             self._task_list(q)
+        elif api == "SYNO.DownloadStation2.Task" and method == "get":
+            tid = json.loads(q.get("id", ["[]"])[0])[0]
+            self._json({"success": True, "data": {"task": [
+                {"id": tid, "status": MockNAS.task_status.get(tid, 2),
+                 "additional": {"transfer": {"size_downloaded": 0}}}]}})
         elif api == "SYNO.DownloadStation2.Task.List" and method == "get":
             self._json({"success": True, "data": {"files": [
                 {"index": 0, "name": "Test Razdacha 2024/Film/film.mkv", "size": 1234567},
@@ -266,6 +272,12 @@ class MockNAS(BaseHTTPRequestHandler):
             self._json({"success": True, "data": {}})
         elif api == "SYNO.DownloadStation2.Task" and method in ("pause", "resume", "delete"):
             MockNAS.captured[method] = q
+            MockNAS.captured.setdefault("actions", []).append(method)
+            for tid in json.loads(q.get("id", ["[]"])[0]) if q.get("id", [""])[0].startswith("[") else q.get("id", []):
+                if method == "pause":
+                    MockNAS.task_status[tid] = 3
+                elif method == "resume":
+                    MockNAS.task_status[tid] = 2
             self._json({"success": True, "data": {}})
         elif api == "SYNO.DownloadStation2.Task.BT.File" and method == "set":
             MockNAS.captured["bt_set"] = q
@@ -421,6 +433,16 @@ def test_client():
         lid3, tid4 = c.create_url_or_list("magnet:?xt=urn:btih:realmagnet", "downloads")
         check("magnet: list_id пуст", lid3 == "", repr(lid3))
         check("magnet: task_id переиспользуется", tid4 == "TID-MAG-1", tid4)
+
+        # «Проверка» (статус 6) после смены wanted — один толчок паузой/возобновлением
+        MockNAS.task_status = {"T-STUCK": 6, "T-OK": 2}
+        MockNAS.captured["actions"] = []
+        check("unstick: нормальную задачу не трогаем", c.unstick_task("T-OK", observe=1) is False
+              and MockNAS.captured["actions"] == [])
+        check("unstick: застрявшую толкаем", c.unstick_task("T-STUCK", observe=1.5) is True)
+        check("unstick: пауза, затем возобновление",
+              MockNAS.captured["actions"] == ["pause", "resume"], str(MockNAS.captured["actions"]))
+        check("unstick: задача снова качается", c.task_status("T-STUCK")[0] == 2)
 
         # неверный пароль
         bad = SynoClient("127.0.0.1", port, use_https=False, username="user", password="wrong")

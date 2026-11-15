@@ -20,7 +20,7 @@ SynoTorrentBridge was built to fix exactly that.
 - **Choose the destination folder** on the NAS for every download (folder tree is read via FileStation). A folder that doesn't exist yet can be created on the fly.
 - **Choose which files to download before anything starts**:
   - `.torrent` — uses Download Station's *pending list* API (`create_list` + `Task.List.Polling download selected=[…]`), so the task is created with only your files wanted.
-  - magnet — the task is created, all files are unwanted the moment metadata arrives, then only the ones you tick are re-enabled.
+  - magnet — the task is created; the moment metadata arrives all files except the smallest one are unwanted (unwanting *all* of them makes Download Station hang in "Checking"), then only the ones you tick stay wanted.
 - **Search & filters** in the file picker: text search, "Only video", "Without subtitles", select all/none, live size counter. Downloading nothing is not allowed — use Cancel.
 - **Full 2FA support** (TOTP) with a *trusted device* — the code is asked once, not on every run.
 - **Duplicate check** — warns if the same torrent is already in Download Station (by info-hash for magnet tasks, by exact name otherwise). The app never touches an existing task it merely *thinks* is the same.
@@ -79,8 +79,10 @@ The result is `dist\SynoTorrentBridge.exe` (version info embedded; the script pr
 python tests\test_all.py          parser, API client vs mock NAS, monitor, updater, registry, uninstall, log
 python tests\gui_smoke.py         dialog layout
 python tests\gui_flow_test.py     add-torrent dialog flow (empty selection, missing folder, task creation)
+python tests\magnet_select_test.py  magnet file selection never leaves zero wanted files
 python tests\otp_flow_test.py     2FA prompt
 python tests\e2e_live.py          read-only check against YOUR configured NAS (nothing is downloaded)
+python tests\e2e_magnet_live.py   magnet flow on YOUR NAS with the open Sintel torrent (task and folder removed afterwards)
 ```
 
 Tests never touch the real handlers, settings or a running monitor: they use their own registry branch and Windows object names.

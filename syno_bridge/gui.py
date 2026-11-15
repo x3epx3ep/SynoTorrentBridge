@@ -1258,7 +1258,7 @@ class AddTorrentDialog:
         def got(files):
             if files:
                 wait.destroy()
-                self._unwant_all_then_dialog(files, state["task_id"], dest)
+                self._unwant_then_dialog(files, state["task_id"], dest)
             else:
                 self.win.after(POLL_INTERVAL * 1000,
                                lambda: self._poll_files(wait, state, dest, started))
@@ -1270,30 +1270,39 @@ class AddTorrentDialog:
 
         run_bg(self.win, check, got, check_err)
 
-    def _unwant_all_then_dialog(self, ds_files: list, task_id: str, dest: str):
-        """Сразу снимает wanted со ВСЕХ файлов (закачка замирает, ничего не качается),
-        затем показывает диалог выбора. Выбранным файлам wanted вернёт диалог."""
+    def _unwant_then_dialog(self, ds_files: list, task_id: str, dest: str):
+        """Пока пользователь выбирает, закачка почти замирает: wanted снимается
+        со всех файлов, КРОМЕ одного самого маленького.
+
+        Снимать wanted со всех нельзя: Download Station переводит такую задачу
+        в «Проверку» (статус 6), и после возврата wanted она там и остаётся
+        (проверено на DS 4.x / DSM 7). Раздачу из одного файла не трогаем вовсе."""
+        if len(ds_files) < 2:
+            self._show_magnet_file_dialog(ds_files, task_id, dest)
+            return
+        keep = min(ds_files, key=lambda f: f["size"])
+
         def work():
-            ids = [f["id"] for f in ds_files]
+            ids = [f["id"] for f in ds_files if f["id"] != keep["id"]]
             return self.client.set_files_skip(task_id, ids, skip=True)
 
         def ok(res):
-            self._show_magnet_file_dialog(ds_files, task_id, dest, all_unwanted=bool(res))
+            self._show_magnet_file_dialog(ds_files, task_id, dest,
+                                          keep_id=keep["id"] if res else None)
 
         def err(e):
-            log.warning("Не удалось снять wanted со всех файлов: %s — "
-                        "диалог в режиме skip", e)
-            self._show_magnet_file_dialog(ds_files, task_id, dest, all_unwanted=False)
+            log.warning("Не удалось снять wanted: %s — диалог в режиме skip", e)
+            self._show_magnet_file_dialog(ds_files, task_id, dest)
 
         run_bg(self.win, work, ok, err)
 
     def _show_magnet_file_dialog(self, ds_files: list, task_id: str, dest: str,
-                                 all_unwanted: bool = False):
+                                 keep_id=None):
         meta = TorrentMeta(name=self.meta.name,
                            files=[TorrentFile(path=f["name"], size=f["size"]) for f in ds_files],
                            total_size=sum(f["size"] for f in ds_files))
         dlg = MagnetFilesDialog(self.root, self.client, meta, task_id, ds_files, dest,
-                                all_unwanted=all_unwanted)
+                                keep_id=keep_id)
         self.win.wait_window(dlg.win)
         if dlg.done:
             self._finish_ok(dest, dlg.skipped)
@@ -1333,18 +1342,19 @@ class AddTorrentDialog:
 class MagnetFilesDialog:
     """Выбор файлов для magnet после получения метаданных.
 
-    collect_only=True — только вернуть выбор (selected_paths), не применять skip.
-    all_unwanted=True — у всех файлов уже снят wanted: при OK вернуть wanted
-    выбранным (вместо снятия wanted с невыбранных).
+    collect_only=True — только вернуть выбор (selected_paths), не применять его.
+    keep_id — у всех файлов, кроме keep_id, wanted уже снят: при OK сначала
+    включаются выбранные, затем выключается keep_id (если он не выбран), так что
+    у задачи ни на миг не остаётся ноль нужных файлов.
     """
 
     def __init__(self, root, client, meta: TorrentMeta, task_id: str, ds_files: list, dest: str,
-                 collect_only: bool = False, all_unwanted: bool = False):
+                 collect_only: bool = False, keep_id=None):
         self.client = client
         self.task_id = task_id
         self.ds_files = ds_files
         self.collect_only = collect_only
-        self.all_unwanted = all_unwanted
+        self.keep_id = keep_id
         self.selected_paths: set = set()
         self.done = False
         self.skipped = 0
@@ -1392,43 +1402,34 @@ class MagnetFilesDialog:
             self.done = True
             self.win.destroy()
             return
-        def find_id(path):
-            name_to_id = getattr(self, "_name_to_id", None)
-            if name_to_id is None:
-                name_to_id = {str(f["name"]).replace("\\", "/"): f["id"]
-                              for f in self.ds_files}
-                self._name_to_id = name_to_id
-            fid = name_to_id.get(path)
-            if fid is None:
-                # пробуем без корневой папки
-                for name, i in name_to_id.items():
-                    if name.split("/", 1)[-1] == path or name.endswith("/" + path):
-                        fid = i
-                        break
-            return fid
+        # meta.files построены из ds_files в том же порядке
+        pairs = list(zip(self.meta.files, self.ds_files))
+        want = [d["id"] for f, d in pairs if f.selected]
+        unwant = [d["id"] for f, d in pairs if not f.selected]
+        keep_id = self.keep_id
 
-        if self.all_unwanted:
-            # wanted уже снят со всех — возвращаем его выбранным
-            targets = [f for f in self.meta.files if f.selected]
-            ids = [fid for f in targets if (fid := find_id(f.path)) is not None]
-
-            def work():
-                if ids:
-                    return (self.client.set_files_skip(self.task_id, ids, skip=False),
-                            len(self.meta.files) - len(ids))
-                return True, len(self.meta.files)
-        else:
-            unselected = [f for f in self.meta.files if not f.selected]
-            ids = [fid for f in unselected if (fid := find_id(f.path)) is not None]
-
-            def work():
-                if ids:
-                    return self.client.set_files_skip(self.task_id, ids, skip=True), len(ids)
-                return True, 0
+        def work():
+            ok = True
+            if keep_id is not None:
+                to_want = [i for i in want if i != keep_id]
+                if to_want:
+                    ok = self.client.set_files_skip(self.task_id, to_want, skip=False)
+                if ok and keep_id not in want:
+                    ok = self.client.set_files_skip(self.task_id, [keep_id], skip=True)
+            elif unwant:
+                ok = self.client.set_files_skip(self.task_id, unwant, skip=True)
+            if ok:
+                self.client.unstick_task(self.task_id)
+            return ok, len(unwant)
 
         def done(res):
             ok, n = res
             self.skipped = n if ok else 0
+            if not ok:
+                messagebox.showwarning(
+                    "Выбор файлов не применён",
+                    "Download Station не принял выбор файлов. Задача осталась — "
+                    "проверьте её файлы в веб-интерфейсе Download Station.", parent=self.win)
             self.done = True
             self.win.destroy()
 

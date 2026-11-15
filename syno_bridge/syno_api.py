@@ -13,6 +13,7 @@ import http.cookiejar
 import json
 import logging
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +24,7 @@ log = logging.getLogger("syno_api")
 # статусы задач DownloadStation2 (проверено на DS 4.x / DSM 7):
 # 5 — завершена, 8 — завершена и раздаётся (seeding)
 DS2_FINISHED = {5, 8}
+DS2_CHECKING = 6   # «Проверка» (hash checking)
 
 
 def short_list(items, limit: int = 8) -> str:
@@ -499,6 +501,51 @@ class SynoClient:
             self._ds2_action("resume", task_id)
         elif task_id:
             self._call("SYNO.DownloadStation.Task", 1, "resume", extra={"id": task_id})
+
+    def task_status(self, task_id: str) -> tuple:
+        """(status, size_downloaded) задачи DS2; (None, 0), если узнать нельзя."""
+        if not (self.ds2 and task_id):
+            return None, 0
+        try:
+            data = self._call("SYNO.DownloadStation2.Task", 2, "get",
+                              extra={"id": json.dumps([task_id]),
+                                     "additional": json.dumps(["transfer"])})
+        except SynoError as e:
+            log.warning("Статус задачи %s: %s", task_id, e)
+            return None, 0
+        tasks = data.get("task") or []
+        if not tasks:
+            return None, 0
+        t = tasks[0]
+        tr = (t.get("additional") or {}).get("transfer") or {}
+        try:
+            status = int(t.get("status"))
+        except (TypeError, ValueError):
+            status = None
+        return status, int(tr.get("size_downloaded") or 0)
+
+    def unstick_task(self, task_id: str, observe: float = 6.0) -> bool:
+        """Страховка после смены wanted: если задача стоит в «Проверке»
+        (статус 6), ничего не скачав, — один раз пауза + возобновление.
+        Возвращает True, если задачу пришлось «толкнуть»."""
+        deadline = time.time() + observe
+        status, done = self.task_status(task_id)
+        while status == DS2_CHECKING and done == 0 and time.time() < deadline:
+            time.sleep(1)
+            status, done = self.task_status(task_id)
+        if status != DS2_CHECKING or done:
+            return False
+        log.warning("Задача %s застряла в «Проверке» — пауза и возобновление", task_id)
+        try:
+            self.pause_task(task_id)
+            for _ in range(10):
+                time.sleep(0.5)
+                if self.task_status(task_id)[0] == 3:
+                    break
+            self.resume_task(task_id)
+        except SynoError as e:
+            log.warning("Не удалось «толкнуть» задачу %s: %s", task_id, e)
+        return True
 
     def delete_task(self, task_id: str) -> None:
         if not task_id:
