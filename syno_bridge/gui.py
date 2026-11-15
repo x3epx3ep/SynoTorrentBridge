@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -17,6 +18,7 @@ from .config import (load_config, save_config, is_configured, base_url,
 from .syno_api import SynoClient, SynoError
 from . import registry_win
 from . import theme
+from . import updater
 
 log = logging.getLogger("gui")
 
@@ -299,6 +301,22 @@ class SettingsDialog(tk.Toplevel):
                         command=self._notify_toggle).pack(anchor="w", padx=10, pady=(2, 10))
         self._refresh_reg()
 
+        # карточка обновлений
+        upd_card = theme.card_frame(self)
+        upd_card.pack(fill="x", padx=10, pady=5)
+        ttk.Label(upd_card, text="Обновления", style="CardTitle.TLabel").pack(
+            anchor="w", padx=10, pady=(10, 2))
+        upd_row = tk.Frame(upd_card, bg=theme.CARD)
+        upd_row.pack(fill="x", padx=10, pady=(2, 10))
+        self.lbl_upd = ttk.Label(upd_row, style="CardMuted.TLabel",
+                                 text=f"Текущая версия: {__version__}")
+        self.lbl_upd.pack(side="left")
+        self.btn_upd = theme.flat_button(upd_row, text="Проверить", kind="chip",
+                                         command=lambda: self._update_check(manual=True))
+        self.btn_upd.pack(side="right", padx=2)
+        # тихая автопроверка при открытии настроек
+        self.after(400, lambda: self._update_check(manual=False))
+
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=12, pady=(6, 12))
         theme.flat_button(btns, text="Проверить подключение",
@@ -329,6 +347,74 @@ class SettingsDialog(tk.Toplevel):
         except OSError as e:
             messagebox.showerror("Ошибка", str(e), parent=self)
         self._refresh_reg()
+
+    # ---- обновления ----
+
+    def _update_check(self, manual: bool):
+        """Проверяет наличие новой версии на GitHub. manual=False — тихий режим."""
+        if not updater.GITHUB_REPO:
+            if manual:
+                self.lbl_upd.config(text=f"Текущая версия: {__version__} • источник обновлений не настроен")
+            return
+        self.btn_upd.config(state="disabled")
+        if manual:
+            self.lbl_upd.config(text="Проверка обновлений…")
+
+        def done(info):
+            try:
+                self.btn_upd.config(state="normal")
+            except tk.TclError:
+                return
+            if info:
+                self.lbl_upd.config(text=f"Доступна новая версия: {info['tag']}!")
+                self._update_offer(info)
+            elif manual:
+                self.lbl_upd.config(text=f"Текущая версия: {__version__} • у вас последняя версия ✓")
+
+        def err(_e):
+            try:
+                self.btn_upd.config(state="normal")
+                if manual:
+                    self.lbl_upd.config(text="Не удалось проверить обновления (нет сети?)")
+            except tk.TclError:
+                pass
+
+        run_bg(self, updater.check_latest, done, err)
+
+    def _update_offer(self, info: dict):
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo("Обновление",
+                                f"Доступна версия {info['tag']}.\n"
+                                f"Автообновление работает только в собранном exe.",
+                                parent=self)
+            return
+        if not messagebox.askyesno(
+                "Обновление",
+                f"Доступна новая версия {info['tag']} (у вас {__version__}).\n\n"
+                f"Скачать и установить сейчас? Приложение перезапустится.",
+                parent=self):
+            return
+        self.lbl_upd.config(text=f"Скачивание {info['tag']}…")
+        dst = updater.temp_target()
+
+        def downloaded(_path):
+            try:
+                self.lbl_upd.config(text="Установка…")
+                updater.install_and_restart(dst)
+            except OSError as e:
+                messagebox.showerror("Обновление", str(e), parent=self)
+                return
+            self.master.destroy()
+            sys.exit(0)
+
+        def dl_err(e):
+            try:
+                self.lbl_upd.config(text="Ошибка скачивания обновления")
+            except tk.TclError:
+                pass
+            messagebox.showerror("Обновление", f"Не удалось скачать: {e}", parent=self)
+
+        run_bg(self, lambda: updater.download(info["url"], dst), downloaded, dl_err)
 
     def _collect(self) -> dict:
         cfg = dict(self.cfg)

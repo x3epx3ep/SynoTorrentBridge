@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from syno_bridge import bencode
 from syno_bridge.config import encrypt_password, decrypt_password
 from syno_bridge.syno_api import SynoClient
+from syno_bridge import updater
 
 FAILED = []
 
@@ -326,10 +327,62 @@ def test_client():
         server.shutdown()
 
 
+# ------------------------------------------------------------- updater
+
+def test_updater():
+    import io
+    from unittest import mock
+
+    check("updater: parse_version v1.4.0", updater.parse_version("v1.4.0") == (1, 4, 0))
+    check("updater: parse_version 1.10.2 > 1.9.9",
+          updater.parse_version("1.10.2") > updater.parse_version("1.9.9"))
+    check("updater: parse_version с суффиксом",
+          updater.parse_version("v2.0.0-beta") == (2, 0, 0))
+
+    class FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def payload(tag, assets):
+        return FakeResp(json.dumps({"tag_name": tag, "assets": assets}).encode())
+
+    exe_asset = [{"name": "SynoTorrentBridge.exe",
+                  "browser_download_url": "https://example/SynoTorrentBridge.exe"}]
+
+    with mock.patch.object(updater, "__version__", "1.4.0"), \
+         mock.patch.object(updater.urllib.request, "urlopen",
+                           return_value=payload("v1.5.0", exe_asset)):
+        info = updater.check_latest("owner/repo")
+        check("updater: новая версия найдена",
+              info is not None and info["tag"] == "v1.5.0"
+              and info["url"].endswith(".exe"))
+
+    with mock.patch.object(updater, "__version__", "1.4.0"), \
+         mock.patch.object(updater.urllib.request, "urlopen",
+                           return_value=payload("v1.4.0", exe_asset)):
+        check("updater: та же версия → None", updater.check_latest("owner/repo") is None)
+
+    with mock.patch.object(updater, "__version__", "1.4.0"), \
+         mock.patch.object(updater.urllib.request, "urlopen",
+                           return_value=payload("v1.3.9", exe_asset)):
+        check("updater: старая версия → None", updater.check_latest("owner/repo") is None)
+
+    with mock.patch.object(updater, "__version__", "1.4.0"), \
+         mock.patch.object(updater.urllib.request, "urlopen",
+                           return_value=payload("v1.5.0", [{"name": "source.zip"}])):
+        check("updater: нет exe в релизе → None", updater.check_latest("owner/repo") is None)
+
+    check("updater: пустой repo → None", updater.check_latest("") is None)
+
+
 if __name__ == "__main__":
     test_bencode()
     test_dpapi()
     test_client()
+    test_updater()
     print()
     if FAILED:
         print(f"ПРОВАЛЕНО: {len(FAILED)}: {FAILED}")

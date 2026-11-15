@@ -25,6 +25,7 @@ SynoTorrentBridge was built to fix exactly that.
 - **Full 2FA support** (TOTP) with a *trusted device* — the code is asked once, not on every run.
 - **Duplicate check** — warns if the same torrent (by info-hash or title) is already in Download Station.
 - **Completion notifications** — an optional background monitor shows a toast when a download finishes.
+- **Auto-update** — checks GitHub Releases from the settings dialog and installs the new exe in one click.
 - **Single .exe, no dependencies** — no Python, no installation required. Just download and run.
 - **Clean uninstall** — appears in Windows "Apps & Features"; uninstall removes protocol handlers, autostart, config and the exe itself.
 
