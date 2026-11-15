@@ -1,21 +1,41 @@
-"""Тесты SynoTorrentBridge: bencode, DPAPI, клиент API против mock-сервера."""
+"""Тесты SynoTorrentBridge: bencode, DPAPI, клиент API против mock-сервера,
+монитор, обновление, реестр, удаление, журнал.
 
+Запуск: python tests\\test_all.py (только стандартная библиотека, Windows).
+Реальные настройки, реестр перехвата и запущенный монитор не трогаются:
+тесты работают в своих ветках реестра и со своими именами объектов Windows.
+"""
+
+import base64
+import hashlib
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
+import time
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 from syno_bridge import bencode
 from syno_bridge.config import encrypt_password, decrypt_password
-from syno_bridge.syno_api import SynoClient
-from syno_bridge import updater
+from syno_bridge.syno_api import SynoClient, SynoError
+from syno_bridge import updater, winsync
 
 FAILED = []
+
+# объекты Windows для тестов — не пересекаются с настоящим монитором
+winsync.MONITOR_MUTEX = "Local\\SynoTorrentBridge.Test.Monitor"
+winsync.MONITOR_STOP_EVENT = "Local\\SynoTorrentBridge.Test.MonitorStop"
+
+PING = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "PING.EXE")
+HASH_A = "0123456789abcdef0123456789abcdef01234567"
 
 
 def check(name, cond, extra=""):
@@ -23,6 +43,13 @@ def check(name, cond, extra=""):
     print(f"[{status}] {name}" + (f" — {extra}" if extra and not cond else ""))
     if not cond:
         FAILED.append(name)
+
+
+def run_locked_exe(path: str, seconds: int = 6) -> subprocess.Popen:
+    """Копия PING.EXE, запущенная на seconds секунд: настоящий «занятый» exe."""
+    shutil.copyfile(PING, path)
+    return subprocess.Popen([path, "-n", str(seconds), "127.0.0.1"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 # ------------------------------------------------------------- bencode
@@ -54,8 +81,20 @@ def test_bencode():
     m2 = bencode.parse_torrent(bencode.dumps(single))
     check("single-file torrent", m2.files[0].path == "one.bin" and m2.total_size == 42)
 
+    # info-hash считается по исходным байтам: ключи здесь НЕ отсортированы
+    raw_info = b"d4:name1:x6:lengthi1e12:piece lengthi1e6:pieces20:" + b"z" * 20 + b"e"
+    raw = b"d8:announce3:abc4:info" + raw_info + b"e"
+    m3 = bencode.parse_torrent(raw)
+    check("info_hash по исходным байтам",
+          m3.info_hash == hashlib.sha1(raw_info).hexdigest(), m3.info_hash)
+
     check("magnet dn", bencode.magnet_display_name(
         "magnet:?xt=urn:btih:abc&dn=Some%20Release%202024") == "Some Release 2024")
+    check("magnet hash hex", bencode.magnet_info_hash(
+        f"magnet:?xt=urn:btih:{HASH_A.upper()}&dn=x") == HASH_A)
+    b32 = base64.b32encode(bytes.fromhex(HASH_A)).decode()
+    check("magnet hash base32", bencode.magnet_info_hash(f"magnet:?xt=urn:btih:{b32}") == HASH_A)
+    check("magnet без хеша", bencode.magnet_info_hash("magnet:?dn=x") == "")
     check("human_size", bencode.human_size(1536) == "1.5 КБ", bencode.human_size(1536))
 
 
@@ -70,8 +109,15 @@ def test_dpapi():
 
 # ------------------------------------------------------------- mock NAS
 
+def default_tasks():
+    return [{"id": "TID-URL-1", "title": "Some Release 2024", "type": "bt", "status": 2,
+             "additional": {"detail": {"uri": f"magnet:?xt=urn:btih:{HASH_A}&dn=Some"}}}]
+
+
 class MockNAS(BaseHTTPRequestHandler):
     captured = {}
+    tasks = default_tasks()
+    dirs = {"/downloads", "/video", "/video/films"}
 
     def log_message(self, *a):
         pass
@@ -84,10 +130,89 @@ class MockNAS(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _auth(self, q):
+        if q.get("account") == ["otpuser"]:
+            # имитация NAS с включённой 2FA
+            if q.get("device_id") == ["DEVID123"]:
+                # доверенное устройство — вход без кода
+                self._json({"success": True, "data": {"sid": "DEVSID"}})
+            elif q.get("otp_code") == ["123456"]:
+                data = {"sid": "OTPSID"}
+                if q.get("enable_device_token") == ["yes"]:
+                    data["device_id"] = "DEVID123"  # auth v7 отдаёт device_id, не did
+                self._json({"success": True, "data": data})
+            else:
+                self._json({"success": False, "error": {"code": 403}})
+        elif q.get("account") == ["user"] and q.get("passwd") == ["pass"]:
+            self._json({"success": True, "data": {"sid": "TESTSID123"}})
+        else:
+            self._json({"success": False, "error": {"code": 400}})
+
+    def _task_list(self, q):
+        limit = int(q.get("limit", ["100"])[0])
+        offset = int(q.get("offset", ["0"])[0])
+        with_detail = "detail" in q.get("additional", [""])[0]
+        page = []
+        for t in MockNAS.tasks[offset:offset + limit]:
+            t = dict(t)
+            if not with_detail:
+                t.pop("additional", None)
+            page.append(t)
+        MockNAS.captured.setdefault("task_list_calls", []).append((offset, limit, with_detail))
+        self._json({"success": True, "data": {"total": len(MockNAS.tasks), "offset": offset,
+                                              "task": page}})
+
+    def _common(self, q, http_method):
+        api = q.get("api", [""])[0]
+        method = q.get("method", [""])[0]
+        if api == "SYNO.API.Auth" and method == "login":
+            MockNAS.captured["login_method"] = http_method
+            MockNAS.captured["login_query_has_passwd"] = "passwd=" in self.path
+            self._auth(q)
+        elif api == "SYNO.API.Auth" and method == "logout":
+            self._json({"success": True, "data": {}})
+        elif api == "SYNO.Test.Slow":
+            time.sleep(2.5)
+            try:
+                self._json({"success": True, "data": {}})
+            except OSError:
+                pass  # клиент уже отключился по тайм-ауту — так и задумано
+        elif api == "SYNO.FileStation.List" and method == "list_share":
+            self._json({"success": True, "data": {"shares": [
+                {"name": "downloads", "path": "/downloads", "isdir": True},
+                {"name": "video", "path": "/video", "isdir": True}]}})
+        elif api == "SYNO.FileStation.List" and method == "list":
+            self._json({"success": True, "data": {"files": [
+                {"name": "films", "path": "/video/films", "isdir": True}]}})
+        elif api == "SYNO.FileStation.List" and method == "getinfo":
+            path = json.loads(q.get("path", ["[]"])[0])[0]
+            if path in MockNAS.dirs:
+                f = {"isdir": True, "name": path.rsplit("/", 1)[-1], "path": path}
+            else:
+                f = {"code": 408, "path": path}
+            self._json({"success": True, "data": {"files": [f]}})
+        elif api == "SYNO.FileStation.CreateFolder":
+            MockNAS.captured["create_folder"] = q
+            self._json({"success": True, "data": {}})
+        elif api == "SYNO.DownloadStation2.Task.BT.File" and method == "list":
+            self._json({"success": True, "data": {"total": 3, "items": [
+                {"id": 0, "name": "Test Razdacha 2024/Film/film.mkv", "size": 1234567, "priority": "normal"},
+                {"id": 1, "name": "Test Razdacha 2024/Subs/Русские субтитры.srt", "size": 5000, "priority": "normal"},
+                {"id": 2, "name": "Test Razdacha 2024/readme.txt", "size": 100, "priority": "normal"}]}})
+        elif api == "SYNO.DownloadStation2.Task" and method == "list":
+            self._task_list(q)
+        elif api == "SYNO.DownloadStation2.Task.List" and method == "get":
+            self._json({"success": True, "data": {"files": [
+                {"index": 0, "name": "Test Razdacha 2024/Film/film.mkv", "size": 1234567},
+                {"index": 1, "name": "Test Razdacha 2024/Subs/Русские субтитры.srt", "size": 5000},
+                {"index": 2, "name": "Test Razdacha 2024/readme.txt", "size": 100}]}})
+        else:
+            return False
+        return True
+
     def do_GET(self):
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         api = q.get("api", [""])[0]
-        method = q.get("method", [""])[0]
         if api == "SYNO.API.Info":
             self._json({"success": True, "data": {
                 "SYNO.API.Auth": {"path": "auth.cgi", "minVersion": 1, "maxVersion": 7},
@@ -97,46 +222,7 @@ class MockNAS(BaseHTTPRequestHandler):
                 "SYNO.FileStation.List": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
                 "SYNO.FileStation.CreateFolder": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
             }})
-        elif api == "SYNO.API.Auth" and method == "login":
-            if q.get("account") == ["otpuser"]:
-                # имитация NAS с включённой 2FA
-                if q.get("device_id") == ["DEVID123"]:
-                    # доверенное устройство — вход без кода
-                    self._json({"success": True, "data": {"sid": "DEVSID"}})
-                elif q.get("otp_code") == ["123456"]:
-                    data = {"sid": "OTPSID"}
-                    if q.get("enable_device_token") == ["yes"]:
-                        data["device_id"] = "DEVID123"  # auth v7 отдаёт device_id, не did
-                    self._json({"success": True, "data": data})
-                else:
-                    self._json({"success": False, "error": {"code": 403}})
-            elif q.get("account") == ["user"] and q.get("passwd") == ["pass"]:
-                self._json({"success": True, "data": {"sid": "TESTSID123"}})
-            else:
-                self._json({"success": False, "error": {"code": 400}})
-        elif api == "SYNO.FileStation.List" and method == "list_share":
-            self._json({"success": True, "data": {"shares": [
-                {"name": "downloads", "path": "/downloads", "isdir": True},
-                {"name": "video", "path": "/video", "isdir": True}]}})
-        elif api == "SYNO.FileStation.List" and method == "list":
-            self._json({"success": True, "data": {"files": [
-                {"name": "films", "path": "/video/films", "isdir": True}]}})
-        elif api == "SYNO.FileStation.CreateFolder":
-            self._json({"success": True, "data": {}})
-        elif api == "SYNO.DownloadStation2.Task.BT.File" and method == "list":
-            self._json({"success": True, "data": {"total": 3, "items": [
-                {"id": 0, "name": "Test Razdacha 2024/Film/film.mkv", "size": 1234567, "priority": "normal"},
-                {"id": 1, "name": "Test Razdacha 2024/Subs/Русские субтитры.srt", "size": 5000, "priority": "normal"},
-                {"id": 2, "name": "Test Razdacha 2024/readme.txt", "size": 100, "priority": "normal"}]}})
-        elif api == "SYNO.DownloadStation2.Task" and method == "list":
-            self._json({"success": True, "data": {"total": 1, "task": [
-                {"id": "TID-URL-1", "title": "Some Release 2024", "type": "bt"}]}})
-        elif api == "SYNO.DownloadStation2.Task.List" and method == "get":
-            self._json({"success": True, "data": {"files": [
-                {"index": 0, "name": "Test Razdacha 2024/Film/film.mkv", "size": 1234567},
-                {"index": 1, "name": "Test Razdacha 2024/Subs/Русские субтитры.srt", "size": 5000},
-                {"index": 2, "name": "Test Razdacha 2024/readme.txt", "size": 100}]}})
-        else:
+        elif not self._common(q, "GET"):
             self._json({"success": False, "error": {"code": 102}})
 
     def do_POST(self):
@@ -157,6 +243,8 @@ class MockNAS(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(body.decode("utf-8", errors="replace"))
         api = q.get("api", [""])[0]
         method = q.get("method", [""])[0]
+        if self._common(q, "POST"):
+            return
         if api == "SYNO.DownloadStation2.Task" and method == "create":
             MockNAS.captured["create"] = q
             if "realmagnet" in q.get("url", [""])[0]:
@@ -179,30 +267,29 @@ class MockNAS(BaseHTTPRequestHandler):
         elif api == "SYNO.DownloadStation2.Task" and method in ("pause", "resume", "delete"):
             MockNAS.captured[method] = q
             self._json({"success": True, "data": {}})
-        elif api == "SYNO.DownloadStation2.Task.BT.File" and method == "list":
-            self._json({"success": True, "data": {"total": 3, "items": [
-                {"id": 0, "name": "Test Razdacha 2024/Film/film.mkv", "size": 1234567, "priority": "normal"},
-                {"id": 1, "name": "Test Razdacha 2024/Subs/Русские субтитры.srt", "size": 5000, "priority": "normal"},
-                {"id": 2, "name": "Test Razdacha 2024/readme.txt", "size": 100, "priority": "normal"}]}})
         elif api == "SYNO.DownloadStation2.Task.BT.File" and method == "set":
             MockNAS.captured["bt_set"] = q
             self._json({"success": True, "data": {}})
-        elif api == "SYNO.DownloadStation2.Task" and method == "list":
-            self._json({"success": True, "data": {"total": 1, "task": [
-                {"id": "TID-URL-1", "title": "Some Release 2024", "type": "bt"}]}})
         else:
             self._json({"success": False, "error": {"code": 103}})
 
 
-def test_client():
-    server = HTTPServer(("127.0.0.1", 0), MockNAS)
-    port = server.server_address[1]
+def start_mock():
+    MockNAS.tasks = default_tasks()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), MockNAS)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1]
+
+
+def test_client():
+    server, port = start_mock()
 
     c = SynoClient("127.0.0.1", port, use_https=False, username="user", password="pass")
     try:
         c.login()
         check("auth: sid", c.sid == "TESTSID123")
+        check("auth: вход POST-запросом", MockNAS.captured.get("login_method") == "POST")
+        check("auth: пароля нет в строке запроса", not MockNAS.captured.get("login_query_has_passwd"))
         check("discover: DS2", c.ds2)
         check("discover: выбор файлов", c.supports_file_selection)
 
@@ -242,8 +329,56 @@ def test_client():
         check("dirs", dirs[0]["path"] == "/video/films")
         c.create_folder("/video", "newdir")
 
-        found = c.find_task_by_hash_or_title(title="Some Release 2024")
-        check("find by title", found == "TID-URL-1", found)
+        # --- папка назначения
+        check("folder_exists: есть", c.folder_exists("video/films") is True)
+        check("folder_exists: нет", c.folder_exists("video/nope") is False)
+        c.create_path("video/new/sub")
+        cf = MockNAS.captured.get("create_folder", {})
+        check("create_path: родитель и имя",
+              cf.get("folder_path") == ["/video/new"] and cf.get("name") == ["sub"], str(cf))
+        check("create_path: force_parent", cf.get("force_parent") == ["true"])
+        try:
+            c.create_path("noshare")
+            check("create_path: общую папку не создаём", False)
+        except SynoError:
+            check("create_path: общую папку не создаём", True)
+
+        # --- дубликаты: только точное имя или хеш, не подстрока
+        check("duplicate: точное имя", c.find_duplicate(title="Some Release 2024") == "Some Release 2024")
+        check("duplicate: подстрока — не дубль", c.find_duplicate(title="Some Release") == "")
+        check("duplicate: по хешу magnet", c.find_duplicate(info_hash=HASH_A.upper()) != "")
+        check("duplicate: чужой хеш", c.find_duplicate(info_hash="f" * 40) == "")
+
+        # --- новая задача ищется только среди появившихся после снимка
+        before = c.task_ids()
+        check("снимок задач", before == {"TID-URL-1"}, str(before))
+        check("новой задачи нет — старую не берём",
+              c.find_new_task(before, "", "Some Release 2024") == "")
+        MockNAS.tasks = default_tasks() + [{"id": "TID-NEW", "title": "Some Release 2024",
+                                            "status": 1, "type": "bt",
+                                            "additional": {"detail": {"uri": "x.torrent"}}}]
+        check("новая задача с тем же именем — берём новую",
+              c.find_new_task(before, "", "Some Release 2024") == "TID-NEW")
+
+        # --- постраничный список задач
+        MockNAS.tasks = [{"id": f"T{i}", "title": f"t{i}", "status": 2} for i in range(250)]
+        MockNAS.captured["task_list_calls"] = []
+        all_tasks = c.list_tasks(page=100)
+        check("list_tasks: все 250 задач", len(all_tasks) == 250, str(len(all_tasks)))
+        check("list_tasks: 3 страницы", len(MockNAS.captured["task_list_calls"]) == 3)
+        MockNAS.tasks = default_tasks()
+
+        # --- тайм-аут превращается в SynoError с понятным текстом
+        slow = SynoClient("127.0.0.1", port, use_https=False, username="user",
+                          password="pass", timeout=1)
+        slow.sid = "x"
+        try:
+            slow._api("SYNO.Test.Slow", 1, "get")
+            check("тайм-аут → SynoError", False)
+        except SynoError as e:
+            check("тайм-аут → SynoError", "тайм-аут" in str(e), str(e))
+        except Exception as e:  # noqa: BLE001
+            check("тайм-аут → SynoError", False, f"{type(e).__name__}: {e}")
 
         # --- поток create_list (как в DS get) ---
         lid = c.create_pending_list_url("magnet:?xt=urn:btih:abc&dn=Test", "downloads/films")
@@ -328,6 +463,79 @@ def test_client():
         server.shutdown()
 
 
+# ------------------------------------------------------------- монитор
+
+def test_monitor():
+    from syno_bridge import monitor
+
+    check("переход 2→8 (докачалась и раздаётся) = завершение", monitor.is_finish_transition(2, 8))
+    check("переход 2→5 = завершение", monitor.is_finish_transition(2, 5))
+    check("переход 8→5 — не новое завершение", not monitor.is_finish_transition(8, 5))
+    check("новая задача сразу 5 — без тоста", not monitor.is_finish_transition(None, 5))
+
+    toasts = []
+    orig_toast, orig_save = monitor.show_toast, monitor._save_state
+    monitor.show_toast = lambda _root, _title, text, **_k: toasts.append(text)
+    monitor._save_state = lambda _s: None
+    try:
+        class FakeClient:
+            tasks = []
+
+            def list_tasks(self):
+                return self.tasks
+
+        fc = FakeClient()
+        m = monitor.Monitor.__new__(monitor.Monitor)
+        m.root, m.cfg, m.client = None, {}, fc
+        m.state, m.snapshot_done, m.otp_warned = {}, False, False
+        fc.tasks = [{"id": "a", "title": "A", "status": 2},
+                    {"id": "b", "title": "B", "status": 2},
+                    {"id": "c", "title": "C", "status": 8}]
+        m._poll()  # первый опрос — только снимок
+        check("монитор: первый опрос без тостов", toasts == [])
+        fc.tasks = [{"id": "a", "title": "A", "status": 8},
+                    {"id": "b", "title": "B", "status": 5},
+                    {"id": "c", "title": "C", "status": 5}]
+        m._poll()
+        check("монитор: тосты для A (раздача) и B", sorted(toasts) == ["A", "B"], str(toasts))
+    finally:
+        monitor.show_toast, monitor._save_state = orig_toast, orig_save
+
+
+# ------------------------------------------------------------- winsync
+
+def test_winsync():
+    script = (
+        "import sys, time; sys.path.insert(0, sys.argv[1]);"
+        "from syno_bridge import winsync;"
+        "winsync.MONITOR_MUTEX = sys.argv[2]; winsync.MONITOR_STOP_EVENT = sys.argv[3];"
+        "l = winsync.MonitorLock(); ok = l.acquire(); print('ready' if ok else 'busy', flush=True);"
+        "t = time.time()\n"
+        "while ok and not l.stop_requested() and time.time() - t < 20: time.sleep(0.1)\n"
+        "l.release()"
+    )
+    p = subprocess.Popen([sys.executable, "-c", script, str(ROOT), winsync.MONITOR_MUTEX,
+                          winsync.MONITOR_STOP_EVENT], stdout=subprocess.PIPE, text=True)
+    line = p.stdout.readline().strip()
+    check("winsync: монитор захватил мьютекс", line == "ready", line)
+    check("winsync: monitor_running", winsync.monitor_running())
+    second = winsync.MonitorLock()
+    check("winsync: второй монитор не запускается", second.acquire() is False)
+    t0 = time.time()
+    check("winsync: stop_monitor сообщил о запущенном", winsync.stop_monitor(timeout=10))
+    try:
+        p.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        p.kill()
+    check("winsync: монитор вышел по сигналу", p.returncode == 0 and time.time() - t0 < 8)
+    check("winsync: мьютекс освобождён", not winsync.monitor_running())
+    fresh = winsync.MonitorLock()
+    check("winsync: новый монитор стартует", fresh.acquire() is True)
+    check("winsync: событие сброшено для нового монитора", not fresh.stop_requested())
+    fresh.release()
+    check("winsync: stop без монитора → False", winsync.stop_monitor(timeout=1) is False)
+
+
 # ------------------------------------------------------------- updater
 
 def test_updater():
@@ -350,8 +558,10 @@ def test_updater():
     def payload(tag, assets):
         return FakeResp(json.dumps({"tag_name": tag, "assets": assets}).encode())
 
-    exe_asset = [{"name": "SynoTorrentBridge.exe",
-                  "browser_download_url": "https://example/SynoTorrentBridge.exe"}]
+    exe_asset = [{"name": "other.exe", "browser_download_url": "https://example/other.exe"},
+                 {"name": "SynoTorrentBridge.exe",
+                  "browser_download_url": "https://example/SynoTorrentBridge.exe",
+                  "digest": "sha256:" + "AB" * 32, "size": 123456}]
 
     with mock.patch.object(updater, "__version__", "1.4.0"), \
          mock.patch.object(updater.urllib.request, "urlopen",
@@ -359,7 +569,9 @@ def test_updater():
         info = updater.check_latest("owner/repo")
         check("updater: новая версия найдена",
               info is not None and info["tag"] == "v1.5.0"
-              and info["url"].endswith(".exe"))
+              and info["url"].endswith("/SynoTorrentBridge.exe"), str(info))
+        check("updater: sha256 из digest", info and info["sha256"] == "ab" * 32)
+        check("updater: размер из релиза", info and info["size"] == 123456)
 
     with mock.patch.object(updater, "__version__", "1.4.0"), \
          mock.patch.object(updater.urllib.request, "urlopen",
@@ -378,14 +590,62 @@ def test_updater():
 
     check("updater: пустой repo → None", updater.check_latest("") is None)
 
+    # download: проверка SHA-256 и размера
+    tmp = tempfile.mkdtemp(prefix="syno_upd_test_")
+    blob = os.urandom(200_000)
+    good = hashlib.sha256(blob).hexdigest()
+    dst = os.path.join(tmp, "dl.exe")
+    with mock.patch.object(updater.urllib.request, "urlopen", return_value=FakeResp(blob)):
+        updater.download("https://x", dst, sha256=good, size=len(blob))
+    check("download: верная сумма — файл на месте", open(dst, "rb").read() == blob)
+    with mock.patch.object(updater.urllib.request, "urlopen", return_value=FakeResp(blob)):
+        try:
+            updater.download("https://x", dst, sha256="0" * 64)
+            check("download: неверная сумма → ошибка", False)
+        except OSError:
+            check("download: неверная сумма → ошибка", True)
+    check("download: файл с неверной суммой удалён", not os.path.exists(dst))
+    with mock.patch.object(updater.urllib.request, "urlopen", return_value=FakeResp(blob)):
+        try:
+            updater.download("https://x", dst, sha256=good, size=len(blob) + 1)
+            check("download: неверный размер → ошибка", False)
+        except OSError:
+            check("download: неверный размер → ошибка", True)
+
     # _pid_alive: текущий процесс жив, несуществующий — нет
     check("updater: _pid_alive(себя)", updater._pid_alive(os.getpid()))
     check("updater: _pid_alive(мёртвый pid)", not updater._pid_alive(0x7FFFFFF0))
 
-    # apply_update: ждёт смерти pid, копирует себя поверх target, handshake создаётся и чистится
-    import subprocess, tempfile, threading, time as _time
+    # replace_exe: target ЗАПУЩЕН (как монитор из того же exe) — замена всё равно проходит
+    target = os.path.join(tmp, "Syno (2).exe")
+    proc = run_locked_exe(target, seconds=8)
+    time.sleep(0.5)
+    try:
+        shutil.copyfile(sys.executable, target)
+        locked = False
+    except OSError:
+        locked = True
+    check("replace_exe: запущенный exe действительно не перезаписать", locked)
+    new_src = os.path.join(tmp, "new.bin")
+    with open(new_src, "wb") as f:
+        f.write(b"NEW VERSION" * 1000)
+    try:
+        updater.replace_exe(new_src, target, attempts=3)
+        check("replace_exe: заменил запущенный exe", open(target, "rb").read() == open(new_src, "rb").read())
+    except OSError as e:
+        check("replace_exe: заменил запущенный exe", False, str(e))
+    check("replace_exe: старый exe отодвинут в .old", os.path.exists(updater.old_path(target)))
+    check("replace_exe: старый процесс продолжает работать", proc.poll() is None)
+    updater.cleanup_leftovers(target)
+    check("cleanup: .old занят — пропущен без ошибки", os.path.exists(updater.old_path(target)))
+    proc.kill()
+    proc.wait()
+    time.sleep(0.5)
+    updater.cleanup_leftovers(target)
+    check("cleanup: .old удалён после выхода процесса", not os.path.exists(updater.old_path(target)))
+    check("cleanup: сам exe не тронут", os.path.exists(target))
 
-    tmp = tempfile.mkdtemp(prefix="syno_apply_test_")
+    # apply_update: ждёт смерти pid, ставит себя на место target, handshake чистится
     target = os.path.join(tmp, "старая версия (2).exe")
     with open(target, "wb") as f:
         f.write(b"OLD")
@@ -393,6 +653,7 @@ def test_updater():
     sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1.5)"])
 
     done = {}
+
     def run_apply():
         try:
             updater.apply_update(target, sleeper.pid, hs, launch=False)
@@ -400,24 +661,128 @@ def test_updater():
         except Exception as e:  # noqa: BLE001
             done["err"] = e
 
-    t0 = _time.time()
+    t0 = time.time()
     th = threading.Thread(target=run_apply, daemon=True)
     th.start()
     th.join(timeout=30)
     data = open(target, "rb").read()
-    check("updater: apply_update дождался смерти старого", _time.time() - t0 >= 1.2)
+    check("updater: apply_update дождался смерти старого", time.time() - t0 >= 1.2)
     check("updater: apply_update заменил target", data == open(sys.executable, "rb").read())
     check("updater: apply_update без ошибок", done.get("ok") is True, str(done.get("err", "")))
     check("updater: handshake удалён после применения", not os.path.exists(hs))
     check("updater: wait_handshake отрабатывает таймаут",
           not updater.wait_handshake(os.path.join(tmp, "нет_такого"), timeout=1))
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------- реестр
+
+def test_registry():
+    import winreg
+    from syno_bridge import registry_win as rw
+
+    base = r"Software\SynoTorrentBridgeTest"
+    saved = (rw.CLASSES, rw.BACKUP_KEY)
+    rw.CLASSES = base + r"\Classes"
+    rw.BACKUP_KEY = base + r"\App\Backup"
+    try:
+        rw._delete_tree(rw.HKCU, base)
+        # «до нас» стоял другой клиент
+        rw._set(rw.HKCU, rf"{rw.CLASSES}\magnet", "", "URL:Magnet link")
+        rw._set(rw.HKCU, rf"{rw.CLASSES}\magnet\shell\open\command", "", '"qbittorrent.exe" "%1"')
+        rw._set(rw.HKCU, rf"{rw.CLASSES}\.torrent", "", "qBittorrent.File.Torrent")
+        rw._set(rw.HKCU, rf"{rw.CLASSES}\.torrent\OpenWithProgids", "qBittorrent.File.Torrent", "")
+
+        rw.register()
+        check("реестр: перехват включён", rw.is_registered())
+        check("реестр: .torrent → наш ProgID",
+              rw._get(rw.HKCU, rf"{rw.CLASSES}\.torrent") == rw.PROGID_TORRENT)
+        rw.register()  # повторное включение не должно затереть копию
+        rw.unregister()
+        check("реестр: magnet вернулся к qBittorrent",
+              rw._get(rw.HKCU, rf"{rw.CLASSES}\magnet\shell\open\command") == '"qbittorrent.exe" "%1"')
+        check("реестр: .torrent вернулся к qBittorrent",
+              rw._get(rw.HKCU, rf"{rw.CLASSES}\.torrent") == "qBittorrent.File.Torrent")
+        check("реестр: чужой OpenWithProgids не удалён",
+              rw._get(rw.HKCU, rf"{rw.CLASSES}\.torrent\OpenWithProgids",
+                      "qBittorrent.File.Torrent") == "")
+        check("реестр: наш ProgID удалён",
+              rw._get(rw.HKCU, rf"{rw.CLASSES}\{rw.PROGID_TORRENT}") is None)
+        check("реестр: перехват выключен", not rw.is_registered())
+
+        # «до нас» ничего не было — после выключения ничего не остаётся
+        rw._delete_tree(rw.HKCU, base)
+        rw.register()
+        rw.unregister()
+        check("реестр: magnet удалён целиком",
+              rw._get(rw.HKCU, rf"{rw.CLASSES}\magnet\shell\open\command") is None)
+        try:
+            winreg.OpenKey(rw.HKCU, rf"{rw.CLASSES}\.torrent").Close()
+            torrent_left = True
+        except OSError:
+            torrent_left = False
+        check("реестр: пустой .torrent удалён", not torrent_left)
+        check("реестр: из исходников пути не чинятся", rw.repair_paths("0") == [])
+    finally:
+        rw._delete_tree(rw.HKCU, base)
+        rw.CLASSES, rw.BACKUP_KEY = saved
+
+
+# ------------------------------------------------------------- удаление
+
+def test_uninstall_delete():
+    from syno_bridge import uninstall
+    tmp = tempfile.mkdtemp(prefix="syno_uninst_test_")
+    exe = os.path.join(tmp, "Syno Torrent's Bridge.exe")   # пробел и апостроф в пути
+    proc = run_locked_exe(exe, seconds=3)
+    time.sleep(0.5)
+    other = os.path.join(tmp, "x.old")
+    open(other, "wb").close()
+    uninstall.schedule_delete([exe, other, os.path.join(tmp, "нет.exe")], wait_pids=[proc.pid])
+    deadline = time.time() + 30
+    while time.time() < deadline and (os.path.exists(exe) or os.path.exists(other)):
+        time.sleep(0.5)
+    check("uninstall: занятый exe удалён после выхода процесса", not os.path.exists(exe))
+    check("uninstall: второй файл удалён", not os.path.exists(other))
+    proc.kill()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------- журнал
+
+def test_log_rotation():
+    import syno_bridge.__main__ as m
+    tmp = Path(tempfile.mkdtemp(prefix="syno_log_test_"))
+    saved = m.LOG_PATH
+    m.LOG_PATH = tmp / "bridge.log"
+    try:
+        m.LOG_PATH.write_bytes(b"x" * (m.LOG_MAX_BYTES + 10))
+        (tmp / "bridge.log.1").write_bytes(b"old1")
+        m._rotate_log()
+        check("журнал: большой файл ушёл в .1", (tmp / "bridge.log.1").stat().st_size > m.LOG_MAX_BYTES)
+        check("журнал: прежний .1 стал .2", (tmp / "bridge.log.2").read_bytes() == b"old1")
+        check("журнал: основной файл освобождён", not m.LOG_PATH.exists())
+        m.LOG_PATH.write_bytes(b"small")
+        m._rotate_log()
+        check("журнал: маленький файл не трогается", m.LOG_PATH.read_bytes() == b"small")
+    finally:
+        m.LOG_PATH = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    from syno_bridge.syno_api import short_list
+    check("журнал: длинные списки сокращаются",
+          short_list(range(240)) == "[0, 1, 2, 3, 4, 5, 6, 7, … всего 240]", short_list(range(240)))
 
 
 if __name__ == "__main__":
     test_bencode()
     test_dpapi()
     test_client()
+    test_monitor()
+    test_winsync()
     test_updater()
+    test_registry()
+    test_uninstall_delete()
+    test_log_rotation()
     print()
     if FAILED:
         print(f"ПРОВАЛЕНО: {len(FAILED)}: {FAILED}")

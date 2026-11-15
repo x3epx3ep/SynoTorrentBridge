@@ -8,15 +8,30 @@
 
 from __future__ import annotations
 
+import http.client
 import http.cookiejar
 import json
 import logging
 import ssl
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 
 log = logging.getLogger("syno_api")
+
+# статусы задач DownloadStation2 (проверено на DS 4.x / DSM 7):
+# 5 — завершена, 8 — завершена и раздаётся (seeding)
+DS2_FINISHED = {5, 8}
+
+
+def short_list(items, limit: int = 8) -> str:
+    """Короткое представление длинного списка для журнала."""
+    items = list(items)
+    if len(items) <= limit:
+        return str(items)
+    head = ", ".join(str(x) for x in items[:limit])
+    return f"[{head}, … всего {len(items)}]"
 
 COMMON_ERRORS = {
     100: "Неизвестная ошибка",
@@ -122,6 +137,12 @@ class SynoClient:
             elif "certificate" in text.lower() or "SSL" in text:
                 hint = " (проблема SSL-сертификата — снимите галочку «Проверять SSL-сертификат»)"
             raise SynoError(f"NAS недоступен ({self.base}): {reason}{hint}") from e
+        except TimeoutError as e:
+            # тайм-аут на чтении ответа приходит не как URLError, а напрямую
+            raise SynoError(f"NAS не ответил вовремя ({self.base}): тайм-аут "
+                            f"{self.timeout} с — NAS перегружен или связь нестабильна") from e
+        except (OSError, http.client.HTTPException) as e:
+            raise SynoError(f"Связь с NAS прервалась ({self.base}): {e}") from e
         try:
             result = json.loads(body.decode("utf-8", errors="replace"))
         except ValueError as e:
@@ -192,7 +213,8 @@ class SynoClient:
                 params["enable_device_token"] = "yes"
                 params.setdefault("device_name", self.device_name)
         try:
-            data = self._request("auth.cgi", params=params)
+            # POST: пароль и код не попадают в строку запроса (и в журналы веб-сервера)
+            data = self._request("auth.cgi", post=params)
         except SynoError as e:
             # коды auth.cgi: 400 — неверный логин/пароль, 402 — нет прав,
             # 403 — требуется OTP, 404 — неверный OTP, 406 — OTP обязателен
@@ -221,14 +243,19 @@ class SynoClient:
                         sorted(data.keys()), [c.name for c in self._cookies])
         log.info("Авторизация успешна (auth v%s)", version)
 
-    def logout(self) -> None:
+    def logout(self, timeout: int | None = None) -> None:
         if self.sid:
+            saved = self.timeout
+            if timeout is not None:
+                self.timeout = timeout
             try:
                 self._request("auth.cgi", params={
                     "api": "SYNO.API.Auth", "version": 1, "method": "logout",
                     "session": "DownloadStation", "_sid": self.sid})
             except Exception:
                 pass
+            finally:
+                self.timeout = saved
             self.sid = None
 
     def ensure(self) -> None:
@@ -248,6 +275,20 @@ class SynoClient:
                 self.ensure()
                 return self._api(api, version, method, extra=extra, post=post)
             raise
+
+    def _upload(self, path: str, body: bytes, boundary: str) -> dict:
+        """multipart-запрос с перелогином при истекшей сессии (как в _call)."""
+        self.ensure()
+        hdrs = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        try:
+            return self._request(f"{path}?_sid={self.sid}", raw_body=body, headers=hdrs)
+        except SynoError as e:
+            if e.code not in (106, 107, 119):
+                raise
+            log.info("Сессия истекла, перелогин")
+            self.sid = None
+            self.ensure()
+            return self._request(f"{path}?_sid={self.sid}", raw_body=body, headers=hdrs)
 
     # ---------- Download Station: создание задач ----------
 
@@ -318,8 +359,7 @@ class SynoClient:
             fields.append(("create_list", "false"))
             body, boundary = self._multipart(fields, "torrent", filename, torrent_bytes)
             path = self.api_info["SYNO.DownloadStation2.Task"]["path"]
-            data = self._request(f"{path}?_sid={self.sid}", raw_body=body,
-                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+            data = self._upload(path, body, boundary)
             ids = data.get("task_id") or []
             return ids[0] if ids else ""
         # DSM 6: параметры в query, файл — POST body
@@ -352,8 +392,7 @@ class SynoClient:
             fields.append(("destination", json.dumps(destination, ensure_ascii=False)))
         body, boundary = self._multipart(fields, "torrent", filename, torrent_bytes)
         path = self.api_info["SYNO.DownloadStation2.Task"]["path"]
-        data = self._request(f"{path}?_sid={self.sid}", raw_body=body,
-                             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        data = self._upload(path, body, boundary)
         ids = data.get("list_id") or []
         return ids[0] if ids else ""
 
@@ -473,26 +512,72 @@ class SynoClient:
         except SynoError as e:
             log.warning("Не удалось удалить задачу %s: %s", task_id, e)
 
-    def find_task_by_hash_or_title(self, info_hash: str = "", title: str = "") -> str:
-        """Ищет task_id среди недавних задач (если create не вернул id)."""
-        try:
+    def list_tasks(self, detail: bool = False, page: int = 100) -> list:
+        """Все задачи Download Station (постранично). Элементы — dict как у NAS:
+        id, title, status, size, (additional.detail.uri при detail=True)."""
+        out: list = []
+        offset = 0
+        while True:
             if self.ds2:
-                # sort_by/reverse на части прошивок возвращают пустой список — не используем
-                data = self._call("SYNO.DownloadStation2.Task", 2, "list",
-                                  extra={"limit": 50})
+                extra = {"limit": page, "offset": offset}
+                if detail:
+                    extra["additional"] = json.dumps(["detail"])
+                data = self._call("SYNO.DownloadStation2.Task", 2, "list", extra=extra)
                 tasks = data.get("task") or data.get("tasks") or []
             else:
-                data = self._call("SYNO.DownloadStation.Task", 1, "list", extra={"limit": 50})
+                extra = {"limit": page, "offset": offset}
+                if detail:
+                    extra["additional"] = "detail"
+                data = self._call("SYNO.DownloadStation.Task", 1, "list", extra=extra)
                 tasks = data.get("tasks") or []
-            for t in tasks:
-                t_title = str(t.get("title", ""))
-                t_uri = str((t.get("additional") or {}).get("detail", {}).get("uri", ""))
-                if info_hash and info_hash.lower() in t_uri.lower():
-                    return str(t.get("id", ""))
-                if title and title and (t_title == title or title in t_title):
-                    return str(t.get("id", ""))
+            out.extend(t for t in tasks if isinstance(t, dict))
+            total = int(data.get("total") or 0)
+            offset += len(tasks)
+            if not tasks or offset >= total or offset > 20000:
+                return out
+
+    @staticmethod
+    def _task_matches(t: dict, info_hash: str, title: str) -> bool:
+        """Совпадение только по точным признакам: info-hash в uri (magnet-задачи)
+        или точное имя задачи. Подстрока имени НЕ считается совпадением."""
+        t_title = str(t.get("title", "")).strip()
+        t_uri = str(((t.get("additional") or {}).get("detail") or {}).get("uri", ""))
+        if info_hash and info_hash.lower() in t_uri.lower():
+            return True
+        return bool(title) and t_title == title.strip()
+
+    def task_ids(self) -> set:
+        """Множество id всех задач — снимок до создания новой."""
+        return {str(t.get("id", "")) for t in self.list_tasks()}
+
+    def find_duplicate(self, info_hash: str = "", title: str = "") -> str:
+        """Есть ли уже такая задача? Возвращает её название или ''.
+        Только для предупреждения пользователя — найденную задачу не трогаем."""
+        if not (info_hash or title):
+            return ""
+        try:
+            for t in self.list_tasks(detail=True):
+                if self._task_matches(t, info_hash, title):
+                    return str(t.get("title", "")) or title
         except SynoError as e:
-            log.warning("Поиск задачи не удался: %s", e)
+            log.warning("Проверка дубликатов не удалась: %s", e)
+        return ""
+
+    def find_new_task(self, before_ids: set, info_hash: str = "", title: str = "") -> str:
+        """id задачи, которая появилась ПОСЛЕ снимка before_ids и совпадает по
+        хешу/имени. Задачи, существовавшие раньше, не возвращаются никогда —
+        иначе можно изменить или удалить чужую (старую) задачу."""
+        try:
+            fresh = [t for t in self.list_tasks(detail=True)
+                     if str(t.get("id", "")) not in before_ids]
+        except SynoError as e:
+            log.warning("Поиск новой задачи не удался: %s", e)
+            return ""
+        matched = [t for t in fresh if self._task_matches(t, info_hash, title)]
+        if len(matched) == 1:
+            return str(matched[0].get("id", ""))
+        if len(matched) > 1:
+            log.warning("Новых задач-кандидатов несколько (%d) — не выбираю ни одну", len(matched))
         return ""
 
     # ---------- Download Station: файлы внутри BT-задачи ----------
@@ -532,16 +617,17 @@ class SynoClient:
         if not (self.ds2 and task_id and file_ids):
             return False
         ids = json.dumps(file_ids)
+        brief = short_list(file_ids)
         # DS 4.x (проверено на 4.1.2): параметр index (JSON-массив) + wanted=false.
         # priority="skip" эта версия отклоняет (ошибка 120, priority: condition).
         try:
             self._call("SYNO.DownloadStation2.Task.BT.File", 2, "set",
                        extra={"task_id": task_id, "index": ids,
                               "wanted": "false" if skip else "true"}, post=True)
-            log.info("BT.File set: OK (index=%s, wanted=%s)", ids, not skip)
+            log.info("BT.File set: OK (index=%s, wanted=%s)", brief, not skip)
             return True
         except SynoError as e:
-            log.warning("BT.File set (index/wanted): %s", e)
+            log.warning("BT.File set (index/wanted) %s: %s", brief, e)
         # запасные варианты для старых версий DS
         priority = '"skip"' if skip else '"normal"'
         for method in ("set", "edit"):
@@ -549,10 +635,10 @@ class SynoClient:
                 params = {"task_id": task_id, idparam: ids, "priority": priority}
                 try:
                     self._call("SYNO.DownloadStation2.Task.BT.File", 2, method, extra=params, post=True)
-                    log.info("BT.File %s: OK (%s=%s, %s)", method, idparam, ids, priority)
+                    log.info("BT.File %s: OK (%s=%s, %s)", method, idparam, brief, priority)
                     return True
                 except SynoError as e:
-                    log.warning("BT.File %s (%s=%s): %s", method, idparam, ids, e)
+                    log.warning("BT.File %s (%s): %s", method, idparam, e)
         return False
 
     # ---------- FileStation: дерево папок ----------
@@ -564,9 +650,38 @@ class SynoClient:
         return [{"name": f["name"], "path": f["path"]}
                 for f in data.get("shares", []) if f.get("isdir")]
 
-    def create_folder(self, parent_path: str, name: str) -> None:
-        self._call("SYNO.FileStation.CreateFolder", 2, "create",
-                   extra={"folder_path": parent_path, "name": name})
+    def create_folder(self, parent_path: str, name: str, force_parent: bool = False) -> None:
+        extra = {"folder_path": parent_path, "name": name}
+        if force_parent:
+            extra["force_parent"] = "true"
+        self._call("SYNO.FileStation.CreateFolder", 2, "create", extra=extra)
+
+    def folder_exists(self, dest: str) -> bool | None:
+        """Есть ли папка dest ('Share/sub', без ведущего '/') на NAS.
+        None — проверить нельзя (FileStation недоступен), True/False — ответ NAS."""
+        path = "/" + dest.strip().strip("/")
+        try:
+            data = self._call("SYNO.FileStation.List", 2, "getinfo",
+                              extra={"path": json.dumps([path], ensure_ascii=False)})
+        except SynoError as e:
+            log.warning("Проверка папки %s невозможна: %s", path, e)
+            return None
+        files = data.get("files") or []
+        if not files or not isinstance(files[0], dict):
+            return None
+        f = files[0]
+        if f.get("code"):
+            return False
+        return bool(f.get("isdir", True))
+
+    def create_path(self, dest: str) -> None:
+        """Создаёт папку dest вместе с промежуточными. Общую папку (первый
+        уровень) создать нельзя — для неё бросается SynoError."""
+        parts = [p for p in dest.strip().strip("/").split("/") if p]
+        if len(parts) < 2:
+            raise SynoError(f"Общей папки «{dest}» нет на NAS. Общие папки создаются "
+                            "в DSM (Панель управления → Общая папка).")
+        self.create_folder("/" + "/".join(parts[:-1]), parts[-1], force_parent=True)
 
     def list_dirs(self, folder_path: str) -> list:
         """Подпапки внутри folder_path: [{name, path}]."""

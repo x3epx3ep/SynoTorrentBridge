@@ -12,15 +12,16 @@ import json
 import logging
 import tkinter as tk
 
-from . import theme
+from . import theme, winsync
 from .config import APP_DIR, load_config, is_configured
-from .syno_api import SynoError
+from .syno_api import SynoError, DS2_FINISHED
 
 log = logging.getLogger("monitor")
 
 POLL_SECONDS = 60
 STATE_PATH = APP_DIR / "monitor_state.json"
-FINISHED = {5}          # DS2: 5 = finished
+FINISHED = DS2_FINISHED  # DS2: 5 — завершена, 8 — завершена и раздаётся
+STOP_CHECK_MS = 1000
 OTP_CODES = {403, 404, 406}
 
 
@@ -88,8 +89,7 @@ class Monitor:
         if self.client is None:
             self.client = self._make_client()
         try:
-            data = self.client._call("SYNO.DownloadStation2.Task", 2, "list",
-                                     extra={"limit": 100})
+            tasks = self.client.list_tasks()
         except SynoError as e:
             if e.code in OTP_CODES:
                 # монитор не может спросить код — предупреждаем один раз
@@ -102,8 +102,12 @@ class Monitor:
             self.client = None  # пересоздадим на следующем цикле
             raise
 
-        tasks = data.get("task") or []
-        current = {str(t.get("id")): int(t.get("status", 0)) for t in tasks}
+        current = {}
+        for t in tasks:
+            try:
+                current[str(t.get("id"))] = int(t.get("status", 0))
+            except (TypeError, ValueError):
+                continue  # DSM 6 отдаёт статус строкой — монитор работает только с DS2
 
         if not self.snapshot_done:
             # первый успешный опрос — только запоминаем, без уведомлений
@@ -111,14 +115,21 @@ class Monitor:
         else:
             for tid, status in current.items():
                 old = self.state.get(tid)
-                if status in FINISHED and old is not None and old not in FINISHED:
+                if is_finish_transition(old, status):
                     title = next((str(t.get("title", "")) for t in tasks
                                   if str(t.get("id")) == tid), tid)
                     log.info("Завершена задача: %s", title)
                     show_toast(self.root, "Загрузка завершена ✓", title)
 
+        self.otp_warned = False
         self.state = current
         _save_state(self.state)
+
+
+def is_finish_transition(old, new) -> bool:
+    """Задача только что докачалась: была в работе, стала завершённой
+    (в том числе сразу ушла на раздачу)."""
+    return new in FINISHED and old is not None and old not in FINISHED
 
 
 def run() -> None:
@@ -126,10 +137,33 @@ def run() -> None:
     if not is_configured(cfg):
         log.warning("Монитор запущен без настроек — выход")
         return
-    root = tk.Tk()
-    root.withdraw()
-    theme.apply_theme(root)
-    mon = Monitor(root, cfg)
-    root.after(2000, mon.poll)  # первый опрос почти сразу
-    log.info("Монитор запущен (опрос каждые %s с)", POLL_SECONDS)
-    root.mainloop()
+    lock = winsync.MonitorLock()
+    if not lock.acquire():
+        log.info("Монитор уже запущен — второй экземпляр не нужен")
+        return
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        theme.apply_theme(root)
+        mon = Monitor(root, cfg)
+
+        def watch_stop():
+            # обновление/удаление программы просит монитор выйти и отпустить exe
+            if lock.stop_requested():
+                log.info("Монитор: получен сигнал остановки")
+                root.quit()
+                return
+            root.after(STOP_CHECK_MS, watch_stop)
+
+        root.after(2000, mon.poll)  # первый опрос почти сразу
+        root.after(STOP_CHECK_MS, watch_stop)
+        log.info("Монитор запущен (опрос каждые %s с)", POLL_SECONDS)
+        root.mainloop()
+        try:
+            if mon.client is not None:
+                mon.client.logout(timeout=5)
+            root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        lock.release()

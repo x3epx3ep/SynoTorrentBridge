@@ -101,13 +101,30 @@ class TorrentMeta:
     is_magnet: bool = False
 
 
+def _raw_info_slice(data: bytes) -> bytes:
+    """Исходные байты словаря info — именно по ним считается info-hash.
+
+    Перекодирование разобранного словаря дало бы другой хеш у торрентов
+    с нестандартной кодировкой (несортированные ключи и т.п.)."""
+    if data[:1] != b"d":
+        return b""
+    pos = 1
+    while data[pos:pos + 1] != b"e":
+        key, pos = _decode(data, pos)
+        start = pos
+        _val, pos = _decode(data, pos)
+        if key == b"info":
+            return data[start:pos]
+    return b""
+
+
 def parse_torrent(data: bytes) -> TorrentMeta:
     raw = loads(data)
     if not isinstance(raw, dict) or b"info" not in raw:
         raise BencodeError("Это не похоже на .torrent файл (нет секции info)")
     info = raw[b"info"]
     meta = TorrentMeta(name="", files=[])
-    meta.info_hash = hashlib.sha1(_encode(info)).hexdigest()
+    meta.info_hash = hashlib.sha1(_raw_info_slice(data) or _encode(info)).hexdigest()
 
     name = info.get(b"name.utf-8") or info.get(b"name") or b""
     meta.name = _text(name)
@@ -137,6 +154,25 @@ def magnet_display_name(uri: str) -> str:
     except Exception:
         pass
     return "magnet-ссылка"
+
+
+def magnet_info_hash(uri: str) -> str:
+    """info-hash (40 hex, нижний регистр) из xt=urn:btih:…; base32-форма
+    переводится в hex. Пустая строка, если хеша нет."""
+    import base64
+    import re
+    m = re.search(r"xt=urn:btih:([0-9a-zA-Z]+)", uri or "")
+    if not m:
+        return ""
+    h = m.group(1)
+    if len(h) == 40 and re.fullmatch(r"[0-9a-fA-F]{40}", h):
+        return h.lower()
+    if len(h) == 32:
+        try:
+            return base64.b32decode(h.upper()).hex()
+        except (ValueError, TypeError):
+            return ""
+    return ""
 
 
 def human_size(n: float) -> str:

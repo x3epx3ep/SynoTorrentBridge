@@ -11,11 +11,11 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
-from urllib.parse import unquote
 
 from . import __version__
-from .bencode import TorrentMeta, TorrentFile, human_size, magnet_display_name
-from .config import (load_config, save_config, is_configured, base_url,
+from .bencode import (TorrentMeta, TorrentFile, human_size, magnet_display_name,
+                      magnet_info_hash)
+from .config import (load_config, save_config, is_configured,
                      encrypt_password, decrypt_password, remember_destination)
 from .syno_api import SynoClient, SynoError
 from . import registry_win
@@ -41,6 +41,10 @@ def run_bg(root: tk.Misc, func, on_done=None, on_error=None):
     def worker():
         try:
             results.put(("ok", func()))
+        except SynoError as e:
+            # ожидаемые ответы NAS (нужен код 2FA, нет папки…) — без трассировки
+            log.warning("Фоновая задача: %s (код %s)", e, e.code)
+            results.put(("err", e))
         except Exception as e:  # noqa: BLE001
             log.exception("Ошибка фоновой задачи")
             results.put(("err", e))
@@ -77,6 +81,24 @@ def make_client(cfg: dict, otp: str = "") -> SynoClient:
 
 # коды ошибок авторизации Synology, означающие «нужен/неверен код 2FA»
 OTP_CODES = {403, 404, 406}
+
+
+class LoginCancelled(SynoError):
+    """Пользователь закрыл окно ввода кода 2FA."""
+
+
+def close_session_async(client: SynoClient, cleanup=None) -> None:
+    """Сетевые действия при закрытии (удалить список/задачу, выйти из сессии)
+    — в отдельном потоке, чтобы окно не замирало при недоступном NAS.
+    Поток не daemon: процесс дождётся его завершения уже без окон."""
+    def work():
+        try:
+            if cleanup:
+                cleanup()
+        except Exception:  # noqa: BLE001
+            log.exception("Очистка при закрытии")
+        client.logout(timeout=5)
+    threading.Thread(target=work, name="close-session").start()
 
 
 class OtpDialog(tk.Toplevel):
@@ -189,7 +211,7 @@ def login_flow(parent, cfg: dict, on_ok, on_error, status_label=None):
                 if code:
                     attempt(code.strip())
                     return
-                on_error(SynoError("Вход отменён: не введён код 2FA"))
+                on_error(LoginCancelled("Вход отменён: не введён код 2FA"))
                 return
             on_error(e)
 
@@ -255,8 +277,9 @@ class SettingsDialog(tk.Toplevel):
         ttk.Entry(card, textvariable=self.v_port, width=8).grid(row=2, column=1, sticky="w", **pad)
 
         self.v_https = tk.BooleanVar(value=bool(self.cfg.get("https")))
-        ttk.Checkbutton(card, text="HTTPS", style="Card.TCheckbutton",
-                        variable=self.v_https).grid(row=3, column=1, sticky="w", **pad)
+        ttk.Checkbutton(card, text="HTTPS (рекомендуется: пароль не идёт по сети открытым текстом)",
+                        style="Card.TCheckbutton", variable=self.v_https,
+                        command=self._https_toggled).grid(row=3, column=1, sticky="w", **pad)
         self.v_verify = tk.BooleanVar(value=bool(self.cfg.get("verify_ssl", True)))
         ttk.Checkbutton(card, text="Проверять SSL-сертификат", style="Card.TCheckbutton",
                         variable=self.v_verify).grid(row=4, column=1, sticky="w", **pad)
@@ -326,6 +349,14 @@ class SettingsDialog(tk.Toplevel):
         theme.flat_button(btns, text="Отмена", command=self.destroy).pack(side="right")
         theme.flat_button(btns, text="Сохранить", kind="accent",
                           command=self._save).pack(side="right", padx=8)
+
+    def _https_toggled(self):
+        """Стандартный порт DSM следует за галочкой HTTPS (5000 ↔ 5001)."""
+        port = self.v_port.get().strip()
+        if self.v_https.get() and port in ("", "5000"):
+            self.v_port.set("5001")
+        elif not self.v_https.get() and port in ("", "5001"):
+            self.v_port.set("5000")
 
     def _notify_toggle(self):
         try:
@@ -438,7 +469,9 @@ class SettingsDialog(tk.Toplevel):
                 pass
             messagebox.showerror("Обновление", f"Не удалось скачать: {e}", parent=self)
 
-        run_bg(self, lambda: updater.download(info["url"], dst), downloaded, dl_err)
+        run_bg(self, lambda: updater.download(info["url"], dst, sha256=info.get("sha256", ""),
+                                              size=info.get("size", 0)),
+               downloaded, dl_err)
 
     def _collect(self) -> dict:
         cfg = dict(self.cfg)
@@ -468,13 +501,22 @@ class SettingsDialog(tk.Toplevel):
             feats = []
             feats.append("DSM 7 (Download Station 2)" if client.ds2 else "DSM 6 (Download Station)")
             feats.append("выбор файлов: да" if client.supports_file_selection else "выбор файлов: нет")
-            try:
-                shares = client.list_shares()
-                feats.append(f"общих папок: {len(shares)}")
-            except Exception:
-                feats.append("FileStation недоступен")
-            client.logout()
-            self.lbl_status.config(text="OK — " + "; ".join(feats), foreground="green")
+
+            def shares():
+                try:
+                    return f"общих папок: {len(client.list_shares())}"
+                except Exception:  # noqa: BLE001
+                    return "FileStation недоступен"
+
+            def show(text):
+                close_session_async(client)
+                try:
+                    self.lbl_status.config(text="OK — " + "; ".join(feats + [text]),
+                                           foreground="green")
+                except tk.TclError:
+                    pass
+
+            run_bg(self, shares, show, lambda _e: show("FileStation недоступен"))
 
         def err(e):
             self.lbl_status.config(text=f"Ошибка: {e}", foreground="red")
@@ -841,51 +883,111 @@ class AddTorrentDialog:
 
     # ---------- отправка ----------
 
-    def _cancel(self):
-        self.client.logout()
-        self.win.destroy()
+    def _close(self, cleanup=None):
+        """Закрыть окно сразу; сеть (cleanup + logout) — в фоне."""
+        close_session_async(self.client, cleanup)
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
         self.root.quit()
+
+    def _cancel(self):
+        self._close()
+
+    def _busy(self, text: str):
+        self.btn_ok.config(state="disabled")
+        self.lbl_status.config(text=text)
+
+    def _idle(self):
+        try:
+            self.btn_ok.config(state="normal")
+            self.lbl_status.config(text="")
+        except tk.TclError:
+            pass
 
     def _selected_paths(self) -> set:
         return {f.path for f in self.meta.files if f.selected}
 
+    def _snapshot(self):
+        """id существующих задач до создания новой (None — не удалось)."""
+        try:
+            return self.client.task_ids()
+        except SynoError as e:
+            log.warning("Снимок задач не удался: %s", e)
+            return None
+
+    def _find_new(self, before) -> str:
+        """id только что созданной задачи среди НОВЫХ (несколько попыток —
+        задача может появиться в списке с задержкой). Старые задачи с похожим
+        именем никогда не подхватываются."""
+        if before is None:
+            return ""
+        for _ in range(4):
+            tid = self.client.find_new_task(before, self.meta.info_hash, self.meta.name)
+            if tid:
+                return tid
+            time.sleep(1.5)
+        return ""
+
     def _submit(self):
+        if self.can_select and not self._selected_paths():
+            messagebox.showwarning("Ничего не выбрано",
+                                   "Отметьте хотя бы один файл для закачки.", parent=self.win)
+            return
         dest = self.v_dest.get().strip().strip("/")
         if not dest:
             if not messagebox.askyesno("Папка не выбрана",
                                        "Не указана папка назначения — будет использована "
                                        "папка по умолчанию Download Station. Продолжить?", parent=self.win):
                 return
-        self._check_duplicate(dest)
+            self._check_duplicate(dest)
+            return
+        self._check_destination(dest)
+
+    def _check_destination(self, dest: str):
+        """Есть ли папка на NAS; если нет — предложить создать."""
+        self._busy("Проверка папки назначения…")
+
+        def ok(exists):
+            self._idle()
+            if exists is False:
+                if not messagebox.askyesno(
+                        "Папки нет на NAS",
+                        f"Папка «/{dest}» не найдена на NAS.\n\nСоздать её?", parent=self.win):
+                    return
+                self._busy("Создание папки…")
+                run_bg(self.win, lambda: self.client.create_path(dest),
+                       lambda _r: (self._idle(), self._check_duplicate(dest)),
+                       lambda e: (self._idle(), messagebox.showerror(
+                           "Ошибка", f"Не удалось создать папку:\n{e}", parent=self.win)))
+                return
+            self._check_duplicate(dest)  # есть или проверить нельзя — продолжаем
+
+        run_bg(self.win, lambda: self.client.folder_exists(dest), ok,
+               lambda _e: (self._idle(), self._check_duplicate(dest)))
 
     def _check_duplicate(self, dest: str):
-        """Если задача с таким именем уже есть в Download Station — предупреждаем."""
-        self.btn_ok.config(state="disabled")
-        self.lbl_status.config(text="Проверка дубликатов…")
+        """Если такая задача уже есть в Download Station — предупреждаем.
+        Совпадение — по info-hash (magnet-задачи) или точному имени."""
+        self._busy("Проверка дубликатов…")
 
         def work():
-            try:
-                info_hash = "" if self.meta.is_magnet else getattr(self.meta, "info_hash", "")
-                return self.client.find_task_by_hash_or_title(info_hash, self.meta.name)
-            except SynoError as e:
-                log.warning("Проверка дубликатов не удалась: %s", e)
-                return ""
+            return self.client.find_duplicate(self.meta.info_hash, self.meta.name)
 
         def ok(found):
-            self.btn_ok.config(state="normal")
-            self.lbl_status.config(text="")
+            self._idle()
             if found:
                 if not messagebox.askyesno(
                         "Такая задача уже есть",
-                        f"В Download Station уже есть задача «{self.meta.name}».\n\n"
+                        f"В Download Station уже есть задача «{found}».\n\n"
                         "Добавить ещё одну копию?", parent=self.win):
                     self._cancel()
                     return
             self._proceed(dest)
 
         def err(_e):
-            self.btn_ok.config(state="normal")
-            self.lbl_status.config(text="")
+            self._idle()
             self._proceed(dest)  # не смогли проверить — не мешаем добавлению
 
         run_bg(self.win, work, ok, err)
@@ -896,7 +998,7 @@ class AddTorrentDialog:
             if pick_later:
                 self._magnet_flow(dest)
                 return
-            self._create_and_finish(self.magnet_uri, dest, task_id_then=None)
+            self._create_and_finish(self.magnet_uri, dest)
             return
 
         # .torrent файл — файлы известны заранее
@@ -930,54 +1032,54 @@ class AddTorrentDialog:
         return indexes if len(indexes) == len(selected_paths) else None
 
     def _create_torrent_flow(self, dest: str, unselected: list):
-        self.btn_ok.config(state="disabled")
-        self.lbl_status.config(text="Отправка торрента на NAS…")
+        self._busy("Отправка торрента на NAS…")
 
         def work():
             if not unselected:
                 return self.client.create_task_file(
                     self.torrent_bytes, self.torrent_filename, dest), 0
-            selected_paths = {f.path for f in self.meta.files if f.selected}
+            selected_paths = self._selected_paths()
             # основной путь (как в DS get): список выбора → задача стартует сразу с выбором
             try:
                 list_id = self.client.create_pending_list_file(
                     self.torrent_bytes, self.torrent_filename, dest)
                 if list_id:
-                    indexes = None
+                    consumed = False
                     try:
                         pending = self.client.get_pending_files(list_id)
                         indexes = self._pending_indexes(pending, selected_paths)
-                        if indexes is not None:
+                        if indexes:
                             # основной путь: selected применяется на стороне NAS
                             # до старта закачки (Task.List.Polling download)
                             try:
                                 self.client.pending_download_selected(list_id, dest, indexes)
+                                consumed = True
                                 log.info("Задача создана с выбором на стороне NAS: "
                                          "%s файлов из %s", len(indexes), len(pending))
                                 return "", len(pending) - len(indexes)
                             except SynoError as e:
                                 log.warning("Polling selected не сработал (%s) — "
                                             "скачиваю список целиком со skip", e)
-                                task_id = self.client.pending_download(list_id, dest)
-                                skipped = 0
-                                if task_id and len(indexes) < len(pending):
-                                    skipped = self._apply_skip(task_id, unselected)
-                                return task_id, skipped
+                            task_id = self.client.pending_download(list_id, dest)
+                            consumed = True
+                            skipped = 0
+                            if task_id and len(indexes) < len(pending):
+                                skipped = self._apply_skip(task_id, unselected)
+                            return task_id, skipped
                         log.warning("Имена файлов не совпали со списком NAS — старый путь")
                     finally:
-                        if not indexes:
+                        if not consumed:
                             self.client.pending_delete(list_id)
             except SynoError as e:
                 log.warning("Список выбора не удался (%s) — старый путь", e)
             # запасной путь: создать задачу и пометить skip на лету
+            before = self._snapshot()
             task_id = self.client.create_task_file(self.torrent_bytes, self.torrent_filename, dest)
-            skipped = 0
-            if unselected and task_id:
-                skipped = self._apply_skip(task_id, unselected)
-            elif unselected and not task_id:
-                task_id = self.client.find_task_by_hash_or_title(self.meta.info_hash, self.meta.name)
-                if task_id:
-                    skipped = self._apply_skip(task_id, unselected)
+            if not task_id:
+                task_id = self._find_new(before)
+            skipped = self._apply_skip(task_id, unselected) if task_id else 0
+            if not task_id:
+                log.warning("NAS не вернул id задачи — выбор файлов не применён")
             return task_id, skipped
 
         def ok(result):
@@ -985,46 +1087,17 @@ class AddTorrentDialog:
             self._finish_ok(dest, skipped)
 
         def err(e):
-            self.btn_ok.config(state="normal")
-            self.lbl_status.config(text="")
+            self._idle()
             messagebox.showerror("Ошибка", f"Не удалось добавить задачу:\n{e}", parent=self.win)
 
         run_bg(self.win, work, ok, err)
 
     def _apply_skip(self, task_id: str, unselected: list) -> int:
         """Ставит skip на невыбранные файлы. Возвращает число помеченных."""
-        deadline = time.time() + 30
-        ds_files = []
-        while time.time() < deadline:
-            ds_files = self.client.list_bt_files(task_id)
-            if ds_files:
-                break
-            time.sleep(2)
-        if not ds_files:
-            log.warning("Не удалось получить список файлов задачи %s", task_id)
-            return 0
-
-        by_path = {f.path: f for f in unselected}
-        ids = []
-        for dsf in ds_files:
-            name = dsf["name"].replace("\\", "/")
-            candidates = [name]
-            if "/" in name:
-                candidates.append(name.split("/", 1)[1])  # без корневой папки раздачи
-            for cand in candidates:
-                cand = cand.lstrip("/")
-                if cand in by_path:
-                    ids.append(dsf["id"])
-                    break
-        if ids:
-            ok = self.client.set_files_skip(task_id, ids, skip=True)
-            if ok:
-                return len(ids)
-            log.warning("set_files_skip не сработал для %s", ids)
-        return 0
+        return self._skip_by_names(task_id, [f.path for f in unselected])
 
     def _skip_by_names(self, task_id: str, names: list) -> int:
-        """Помечает skip файлы задачи по именам (имена уже в NAS-формате)."""
+        """Помечает skip файлы задачи по именам (с корневой папкой раздачи или без)."""
         targets = set()
         for n in names:
             targets.update(self._name_variants(n))
@@ -1049,56 +1122,66 @@ class AddTorrentDialog:
         if ids and self.client.set_files_skip(task_id, ids, skip=True):
             return len(ids)
         if ids:
-            log.warning("set_files_skip не сработал для %s", ids)
+            log.warning("set_files_skip не сработал (%d файлов)", len(ids))
         return 0
 
     # --- поток для magnet ---
 
     def _magnet_flow(self, dest: str):
-        self.btn_ok.config(state="disabled")
-        self.lbl_status.config(text="Добавление magnet-ссылки…")
+        self._busy("Добавление magnet-ссылки…")
         wait = WaitDialog(self.win, "Добавление magnet-ссылки", "Отправка ссылки на NAS…")
 
         # основной путь: пробуем список выбора. ВАЖНО: для magnet NAS игнорирует
         # create_list и сразу создаёт задачу — её task_id надо переиспользовать,
         # иначе повторный create сделает дубль.
         def create():
-            return self.client.create_url_or_list(self.magnet_uri, dest)
+            before = self._snapshot()
+            list_id, task_id = self.client.create_url_or_list(self.magnet_uri, dest)
+            if not list_id and not task_id:
+                # NAS не вернул id — ищем только среди задач, появившихся сейчас
+                task_id = self._find_new(before)
+            return list_id, task_id
 
         def after_create(result):
             list_id, task_id = result
+            if wait.cancelled:
+                self._close(lambda: (self.client.pending_delete(list_id) if list_id
+                                     else self.client.delete_task(task_id)))
+                return
             if list_id:
                 wait.set_text("NAS получает метаданные торрента от пиров…\n"
                               "Это может занять до пары минут.")
                 self._poll_pending(wait, list_id, dest, time.time())
                 return
+            if not task_id:
+                wait.destroy()
+                self._finish_ok(dest, 0, note="Задача добавлена, но выбор файлов недоступен "
+                                              "(NAS не вернул id задачи).")
+                return
             # magnet: задача уже создана — идём в поток «unwant-all → диалог»
-            self._magnet_flow_legacy(wait, dest, task_id=task_id)
+            wait.set_text("NAS получает метаданные торрента от пиров…\n"
+                          "Это может занять до пары минут.")
+            self._poll_files(wait, {"task_id": task_id}, dest, time.time())
 
         def create_err(e):
             wait.destroy()
-            self.btn_ok.config(state="normal")
-            self.lbl_status.config(text="")
+            self._idle()
             messagebox.showerror("Ошибка", f"Не удалось добавить magnet:\n{e}", parent=self.win)
 
         run_bg(self.win, create, after_create, create_err)
 
     def _poll_pending(self, wait: WaitDialog, list_id: str, dest: str, started: float):
         if wait.cancelled:
-            self.client.pending_delete(list_id)
-            self.client.logout()
-            self.win.destroy()
-            self.root.quit()
+            self._close(lambda: self.client.pending_delete(list_id))
             return
         if time.time() - started > POLL_TIMEOUT:
             wait.destroy()
-            self.client.pending_delete(list_id)
+            run_bg(self.win, lambda: self.client.pending_delete(list_id))
             messagebox.showwarning(
                 "Таймаут",
                 "NAS не смог получить метаданные за отведённое время.\n"
                 "Задача не создана — попробуйте ещё раз позже.", parent=self.win)
-            self.btn_ok.config(state="normal")
-            self.lbl_status.config(text="")
+            self._idle()
             return
 
         def check():
@@ -1126,10 +1209,7 @@ class AddTorrentDialog:
         dlg = MagnetFilesDialog(self.root, self.client, meta, "", [], dest, collect_only=True)
         self.win.wait_window(dlg.win)
         if not dlg.done:
-            self.client.pending_delete(list_id)
-            self.client.logout()
-            self.win.destroy()
-            self.root.quit()
+            self._close(lambda: self.client.pending_delete(list_id))
             return
         selected = dlg.selected_paths
         indexes = [p["index"] for p in pending if p["name"] in selected]
@@ -1153,46 +1233,14 @@ class AddTorrentDialog:
             self._finish_ok(dest, skipped)
 
         def err(e):
-            self.btn_ok.config(state="normal")
-            self.lbl_status.config(text="")
+            self._idle()
             messagebox.showerror("Ошибка", f"Не удалось создать задачу:\n{e}", parent=self.win)
 
         run_bg(self.win, work, ok, err)
 
-    def _magnet_flow_legacy(self, wait: WaitDialog, dest: str, task_id: str = ""):
-        state = {"task_id": task_id}
-
-        def create():
-            return task_id or self.client.create_task_url(self.magnet_uri, dest)
-
-        def after_create(task_id):
-            state["task_id"] = task_id
-            if not task_id:
-                task_id = self.client.find_task_by_hash_or_title(title=self.meta.name)
-                state["task_id"] = task_id
-            if not task_id:
-                wait.destroy()
-                self._finish_ok(dest, 0, note="Задача добавлена, но выбор файлов недоступен "
-                                              "(NAS не вернул id задачи).")
-                return
-            wait.set_text("NAS получает метаданные торрента от пиров…\n"
-                          "Это может занять до пары минут.")
-            self._poll_files(wait, state, dest, time.time())
-
-        def create_err(e):
-            wait.destroy()
-            self.btn_ok.config(state="normal")
-            self.lbl_status.config(text="")
-            messagebox.showerror("Ошибка", f"Не удалось добавить magnet:\n{e}", parent=self.win)
-
-        run_bg(self.win, create, after_create, create_err)
-
     def _poll_files(self, wait: WaitDialog, state: dict, dest: str, started: float):
         if wait.cancelled:
-            self.client.delete_task(state["task_id"])
-            self.client.logout()
-            self.win.destroy()
-            self.root.quit()
+            self._close(lambda: self.client.delete_task(state["task_id"]))
             return
         if time.time() - started > POLL_TIMEOUT:
             wait.destroy()
@@ -1229,8 +1277,8 @@ class AddTorrentDialog:
             ids = [f["id"] for f in ds_files]
             return self.client.set_files_skip(task_id, ids, skip=True)
 
-        def ok(_res):
-            self._show_magnet_file_dialog(ds_files, task_id, dest, all_unwanted=True)
+        def ok(res):
+            self._show_magnet_file_dialog(ds_files, task_id, dest, all_unwanted=bool(res))
 
         def err(e):
             log.warning("Не удалось снять wanted со всех файлов: %s — "
@@ -1250,24 +1298,21 @@ class AddTorrentDialog:
         if dlg.done:
             self._finish_ok(dest, dlg.skipped)
         else:
-            self.client.delete_task(task_id)
-            self.client.logout()
-            self.win.destroy()
-            self.root.quit()
+            self._close(lambda: self.client.delete_task(task_id))
 
     # --- завершение ---
 
-    def _create_and_finish(self, url: str, dest: str, task_id_then):
-        self.btn_ok.config(state="disabled")
-        self.lbl_status.config(text="Отправка на NAS…")
+    def _create_and_finish(self, url: str, dest: str):
+        self._busy("Отправка на NAS…")
 
         def work():
             return self.client.create_task_url(url, dest)
 
-        run_bg(self.win, work,
-               lambda _t: self._finish_ok(dest, 0),
-               lambda e: (self.btn_ok.config(state="normal"),
-                          messagebox.showerror("Ошибка", str(e), parent=self.win)))
+        def err(e):
+            self._idle()
+            messagebox.showerror("Ошибка", f"Не удалось добавить задачу:\n{e}", parent=self.win)
+
+        run_bg(self.win, work, lambda _t: self._finish_ok(dest, 0), err)
 
     def _finish_ok(self, dest: str, skipped: int, note: str = ""):
         cfg = self.cfg
@@ -1281,10 +1326,8 @@ class AddTorrentDialog:
             msg += f"\nИсключено файлов: {skipped}"
         if note:
             msg += f"\n{note}"
-        self.client.logout()
         messagebox.showinfo("Готово", msg, parent=self.win)
-        self.win.destroy()
-        self.root.quit()
+        self._close()
 
 
 class MagnetFilesDialog:
@@ -1339,6 +1382,11 @@ class MagnetFilesDialog:
         self.win.destroy()
 
     def _ok(self):
+        if not any(f.selected for f in self.meta.files):
+            messagebox.showwarning("Ничего не выбрано",
+                                   "Отметьте хотя бы один файл. Чтобы отказаться от "
+                                   "закачки, нажмите «Отмена».", parent=self.win)
+            return
         if self.collect_only:
             self.selected_paths = {f.path for f in self.meta.files if f.selected}
             self.done = True
@@ -1444,35 +1492,40 @@ def run_add(source: str):
         state["client"] = client
         try:
             if source.lower().startswith("magnet:"):
-                meta = TorrentMeta(name=magnet_display_name(source), is_magnet=True)
+                meta = TorrentMeta(name=magnet_display_name(source), is_magnet=True,
+                                   info_hash=magnet_info_hash(source))
                 AddTorrentDialog(root, client, meta, magnet_uri=source)
             else:
                 with open(source, "rb") as fh:
                     data = fh.read()
                 from .bencode import parse_torrent
                 meta = parse_torrent(data)
-                import os
                 AddTorrentDialog(root, client, meta,
                                  torrent_bytes=data,
                                  torrent_filename=os.path.basename(source))
         except Exception as e:  # noqa: BLE001
             log.exception("Не удалось открыть источник")
-            client.logout()
+            close_session_async(client)
             messagebox.showerror("Ошибка", str(e), parent=root)
             root.quit()
 
     def conn_err(e):
         splash.destroy()
-        if "2FA" in str(e):
+        if isinstance(e, LoginCancelled):
             # пользователь сам отменил ввод кода — просто закрываемся, без лишних окон
-            root.destroy()
+            root.quit()
             return
         messagebox.showerror("Ошибка подключения",
                              f"Не удалось подключиться к NAS:\n{e}\n\n"
                              f"Проверьте настройки.", parent=root)
-        open_settings()
-        root.destroy()
+        root.withdraw()
+        dlg = SettingsDialog(root)
+        root.wait_window(dlg)
+        root.quit()
 
     login_flow(splash, cfg, connected, conn_err)
     root.mainloop()
-    root.destroy()
+    try:
+        root.destroy()
+    except tk.TclError:
+        pass

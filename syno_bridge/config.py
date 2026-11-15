@@ -19,8 +19,8 @@ LOG_PATH = APP_DIR / "bridge.log"
 
 _DEFAULTS = {
     "host": "",            # например 192.168.1.10 или nas.local
-    "port": 5000,
-    "https": False,
+    "port": 5001,          # по умолчанию HTTPS: пароль не идёт по сети открытым текстом
+    "https": True,
     "verify_ssl": True,
     "username": "",
     "password_enc": "",    # base64(DPAPI)

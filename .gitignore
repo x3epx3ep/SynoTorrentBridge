@@ -17,3 +17,9 @@ Thumbs.db
 .DS_Store
 .idea/
 .vscode/
+
+# venv
+.venv/
+
+# build
+version_info.txt
