@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import sys
 import threading
@@ -404,8 +405,13 @@ class SettingsDialog(tk.Toplevel):
             except OSError as e:
                 messagebox.showerror("Обновление", str(e), parent=self)
                 return
-            self.master.destroy()
-            sys.exit(0)
+            # bat-скрипт уже запущен и ждёт — выходим немедленно, чтобы освободить exe.
+            # destroy() может упасть, если root уже уничтожен — игнорируем.
+            try:
+                self.master.destroy()
+            except tk.TclError:
+                pass
+            os._exit(0)
 
         def dl_err(e):
             try:

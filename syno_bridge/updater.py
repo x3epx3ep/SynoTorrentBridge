@@ -74,18 +74,28 @@ def install_and_restart(new_exe: str) -> None:
     """Подменяет текущий exe на new_exe и перезапускает приложение.
 
     Должно вызываться ПОСЛЕДНИМ действием перед выходом: процесс завершается,
-    а отложенный cmd ждёт, подменяет файл и запускает новую копию.
+    а отложенный bat-скрипт ждёт, подменяет файл и запускает новую копию.
     Работает только в собранном exe (PyInstaller).
+
+    Команда пишется в .bat, а не передаётся через cmd /c: subprocess
+    экранирует вложенные кавычки бэкслешами (\\"), а cmd их не снимает —
+    пути ломаются. chcp 65001 + UTF-8 — чтобы cmd правильно прочитал
+    кириллицу в путях.
     """
     current = sys.executable
     if not getattr(sys, "frozen", False):
         raise OSError("Обновление возможно только в собранном exe")
-    # start с пустым заголовком окна: start "" "path"
-    cmd = (f'timeout /t 2 /nobreak >nul & '
-           f'move /y "{new_exe}" "{current}" >nul & '
-           f'start "" "{current}"')
-    log.info("Обновление: %s", cmd)
-    subprocess.Popen(["cmd", "/c", cmd], creationflags=subprocess.CREATE_NO_WINDOW,
+    bat = os.path.join(tempfile.gettempdir(), "syno_update.bat")
+    with open(bat, "w", encoding="utf-8") as f:
+        f.write("@echo off\n"
+                "chcp 65001 >nul\n"
+                "timeout /t 2 /nobreak >nul\n"
+                f'move /y "{new_exe}" "{current}" >nul\n'
+                f'start "" "{current}"\n'
+                'del "%~f0"\n')
+    log.info("Обновление: %s -> %s", new_exe, current)
+    # строковая форма — subprocess НЕ экранирует кавычки
+    subprocess.Popen(f'cmd /c ""{bat}""', creationflags=subprocess.CREATE_NO_WINDOW,
                      close_fds=True)
 
 
