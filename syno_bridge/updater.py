@@ -86,12 +86,25 @@ def install_and_restart(new_exe: str) -> None:
     if not getattr(sys, "frozen", False):
         raise OSError("Обновление возможно только в собранном exe")
     bat = os.path.join(tempfile.gettempdir(), "syno_update.bat")
+    ps_sleep = 'powershell -NoProfile -Command "Start-Sleep -Milliseconds {ms}" >nul 2>&1'
     with open(bat, "w", encoding="utf-8") as f:
         f.write("@echo off\n"
                 "chcp 65001 >nul\n"
-                "timeout /t 2 /nobreak >nul\n"
-                f'move /y "{new_exe}" "{current}" >nul\n'
+                # timeout/ping без консоли завершаются мгновенно — ждём через PowerShell
+                + ps_sleep.format(ms=1500) + "\n"
+                "set /a tries=0\n"
+                ":retry\n"
+                f'move /y "{new_exe}" "{current}" >nul 2>&1\n'
+                "if %errorlevel%==0 goto moved\n"
+                "set /a tries+=1\n"
+                "if %tries% geq 20 goto end\n"
+                + ps_sleep.format(ms=700) + "\n"
+                "goto retry\n"
+                ":moved\n"
+                # даём антивирусу дочекать новый файл перед запуском
+                + ps_sleep.format(ms=500) + "\n"
                 f'start "" "{current}"\n'
+                ":end\n"
                 'del "%~f0"\n')
     log.info("Обновление: %s -> %s", new_exe, current)
     # строковая форма — subprocess НЕ экранирует кавычки
