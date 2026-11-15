@@ -6,6 +6,7 @@ import logging
 import os
 import queue
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -399,19 +400,36 @@ class SettingsDialog(tk.Toplevel):
         dst = updater.temp_target()
 
         def downloaded(_path):
+            hs = os.path.join(tempfile.gettempdir(),
+                              f"syno_apply_{int(time.time())}.ok")
             try:
                 self.lbl_upd.config(text="Установка…")
-                updater.install_and_restart(dst)
+                updater.launch_applier(dst, sys.executable, hs)
             except OSError as e:
                 messagebox.showerror("Обновление", str(e), parent=self)
                 return
-            # bat-скрипт уже запущен и ждёт — выходим немедленно, чтобы освободить exe.
-            # destroy() может упасть, если root уже уничтожен — игнорируем.
-            try:
-                self.master.destroy()
-            except tk.TclError:
-                pass
-            os._exit(0)
+
+            # Ждём рукопожатия (в фоне): новый exe запустился и применит себя сам.
+            # Таймаут — значит новый exe не стартовал; старая версия цела.
+            def hs_done(ok):
+                if ok:
+                    try:
+                        self.master.destroy()
+                    except tk.TclError:
+                        pass
+                    os._exit(0)
+                try:
+                    os.remove(hs)
+                except OSError:
+                    pass
+                self.lbl_upd.config(text="Не удалось установить обновление")
+                messagebox.showerror(
+                    "Обновление",
+                    "Новая версия не запустилась (возможно, её задержал антивирус).\n"
+                    "Текущая версия не изменена — попробуйте обновиться ещё раз.",
+                    parent=self)
+
+            run_bg(self, lambda: updater.wait_handshake(hs, timeout=40), hs_done)
 
         def dl_err(e):
             try:

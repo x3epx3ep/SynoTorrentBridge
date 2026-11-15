@@ -45,6 +45,11 @@ def main(argv: list | None = None) -> int:
         return 0
 
     cmd = args[0]
+    if cmd == "--apply-update" and len(args) >= 4:
+        # режим второй стадии обновления: нас запустила старая версия
+        from . import updater
+        updater.apply_update(args[1], int(args[2]), args[3])
+        return 0
     if cmd in ("--settings", "-s"):
         gui.open_settings()
         return 0

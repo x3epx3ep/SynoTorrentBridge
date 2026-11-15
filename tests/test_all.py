@@ -1,6 +1,7 @@
 """Тесты SynoTorrentBridge: bencode, DPAPI, клиент API против mock-сервера."""
 
 import json
+import os
 import sys
 import threading
 import urllib.parse
@@ -376,6 +377,40 @@ def test_updater():
         check("updater: нет exe в релизе → None", updater.check_latest("owner/repo") is None)
 
     check("updater: пустой repo → None", updater.check_latest("") is None)
+
+    # _pid_alive: текущий процесс жив, несуществующий — нет
+    check("updater: _pid_alive(себя)", updater._pid_alive(os.getpid()))
+    check("updater: _pid_alive(мёртвый pid)", not updater._pid_alive(0x7FFFFFF0))
+
+    # apply_update: ждёт смерти pid, копирует себя поверх target, handshake создаётся и чистится
+    import subprocess, tempfile, threading, time as _time
+
+    tmp = tempfile.mkdtemp(prefix="syno_apply_test_")
+    target = os.path.join(tmp, "старая версия (2).exe")
+    with open(target, "wb") as f:
+        f.write(b"OLD")
+    hs = os.path.join(tmp, "hs.ok")
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1.5)"])
+
+    done = {}
+    def run_apply():
+        try:
+            updater.apply_update(target, sleeper.pid, hs, launch=False)
+            done["ok"] = True
+        except Exception as e:  # noqa: BLE001
+            done["err"] = e
+
+    t0 = _time.time()
+    th = threading.Thread(target=run_apply, daemon=True)
+    th.start()
+    th.join(timeout=30)
+    data = open(target, "rb").read()
+    check("updater: apply_update дождался смерти старого", _time.time() - t0 >= 1.2)
+    check("updater: apply_update заменил target", data == open(sys.executable, "rb").read())
+    check("updater: apply_update без ошибок", done.get("ok") is True, str(done.get("err", "")))
+    check("updater: handshake удалён после применения", not os.path.exists(hs))
+    check("updater: wait_handshake отрабатывает таймаут",
+          not updater.wait_handshake(os.path.join(tmp, "нет_такого"), timeout=1))
 
 
 if __name__ == "__main__":
