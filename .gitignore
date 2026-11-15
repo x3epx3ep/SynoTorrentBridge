@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Tests with local/private data
+tests/e2e_pending.py
+tests/gui_screenshot.png
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
