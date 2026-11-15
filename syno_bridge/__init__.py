@@ -3,4 +3,4 @@
 __version__ = "1.4.0"
 APP_NAME = "SynoTorrentBridge"
 # Репозиторий с релизами для автообновления ("owner/repo"); пусто — проверка отключена
-GITHUB_REPO = ""
+GITHUB_REPO = "x3epx3ep/SynoTorrentBridge"
