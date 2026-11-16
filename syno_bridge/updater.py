@@ -57,6 +57,27 @@ def parse_version(s: str) -> tuple:
     return tuple(parts) or (0,)
 
 
+def describe_error(e: BaseException) -> str:
+    """Короткая понятная причина сбоя проверки/скачивания обновления."""
+    import urllib.error
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code in (403, 429):
+            return ("GitHub временно ограничил число запросов с вашего адреса "
+                    "(общий адрес в офисной сети?) — попробуйте позже")
+        return f"GitHub ответил ошибкой HTTP {e.code}"
+    reason = getattr(e, "reason", e)
+    if tls.is_cert_error(reason):
+        return f"сертификат GitHub не прошёл проверку: {tls.describe(reason)}"
+    if isinstance(reason, TimeoutError) or "timed out" in str(reason):
+        return "GitHub не ответил вовремя — нет интернета или его блокирует прокси"
+    text = tls.describe(reason) if isinstance(reason, BaseException) else str(reason)
+    if "11001" in text or "getaddrinfo" in text:
+        return "не удаётся найти github.com — нет интернета или нужен прокси"
+    if "407" in text:
+        return "прокси требует авторизации"
+    return f"нет связи с GitHub: {text}"
+
+
 def check_latest(repo: str = GITHUB_REPO, timeout: int = 15) -> dict | None:
     """Возвращает {'tag', 'url', 'name', 'sha256', 'size'} если на GitHub есть
     версия новее, иначе None. Бросает исключение при сетевых ошибках."""

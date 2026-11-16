@@ -338,7 +338,8 @@ class SettingsDialog(tk.Toplevel):
         upd_row = tk.Frame(upd_card, bg=theme.CARD)
         upd_row.pack(fill="x", padx=px(10), pady=px(2, 10))
         self.lbl_upd = ttk.Label(upd_row, style="CardMuted.TLabel",
-                                 text=f"Текущая версия: {__version__}")
+                                 text=f"Текущая версия: {__version__}",
+                                 wraplength=px(330), justify="left")
         self.lbl_upd.pack(side="left")
         self.btn_upd = theme.flat_button(upd_row, text="Проверить", kind="chip",
                                          command=lambda: self._update_check(manual=True))
@@ -408,11 +409,12 @@ class SettingsDialog(tk.Toplevel):
             elif manual:
                 self.lbl_upd.config(text=f"Текущая версия: {__version__} • у вас последняя версия ✓")
 
-        def err(_e):
+        def err(e):
             try:
                 self.btn_upd.config(state="normal")
                 if manual:
-                    self.lbl_upd.config(text="Не удалось проверить обновления (нет сети?)")
+                    self.lbl_upd.config(text="Не удалось проверить обновления: "
+                                             + updater.describe_error(e))
             except tk.TclError:
                 pass
 
@@ -471,7 +473,8 @@ class SettingsDialog(tk.Toplevel):
                 self.lbl_upd.config(text="Ошибка скачивания обновления")
             except tk.TclError:
                 pass
-            messagebox.showerror("Обновление", f"Не удалось скачать: {e}", parent=self)
+            messagebox.showerror("Обновление", f"Не удалось скачать: {updater.describe_error(e)}",
+                                 parent=self)
 
         run_bg(self, lambda: updater.download(info["url"], dst, sha256=info.get("sha256", ""),
                                               size=info.get("size", 0)),

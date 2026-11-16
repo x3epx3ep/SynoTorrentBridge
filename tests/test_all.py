@@ -804,6 +804,22 @@ def test_tls():
     check("tls: не сертификат", tls.cert_hint(ConnectionRefusedError(10061, "x"), "nas.lan") == "")
 
 
+def test_update_errors():
+    import socket
+    import ssl
+    import urllib.error
+    d = updater.describe_error
+    check("обновление: лимит GitHub",
+          "ограничил" in d(urllib.error.HTTPError("u", 403, "rate limit", {}, None)))
+    e = ssl.SSLCertVerificationError("корень не доверенный")
+    check("обновление: сертификат", "сертификат GitHub" in d(urllib.error.URLError(e)))
+    check("обновление: нет DNS", "github.com" in d(urllib.error.URLError(
+        socket.gaierror(11001, "getaddrinfo failed"))))
+    check("обновление: тайм-аут", "вовремя" in d(urllib.error.URLError(TimeoutError("timed out"))))
+    check("обновление: прочее", d(urllib.error.URLError(ConnectionResetError(10054, "reset")))
+          .startswith("нет связи с GitHub"))
+
+
 def test_dpi():
     from syno_bridge import dpi
     old = dpi._factor
@@ -870,6 +886,7 @@ if __name__ == "__main__":
     test_log_rotation()
     test_tls()
     test_dpi()
+    test_update_errors()
     print()
     if FAILED:
         print(f"ПРОВАЛЕНО: {len(FAILED)}: {FAILED}")
