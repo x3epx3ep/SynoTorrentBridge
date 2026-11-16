@@ -41,7 +41,7 @@ def on_err(e):
 def watch_for_otp_dialog():
     """Ищем OtpDialog среди окон и вводим код."""
     for w in root.winfo_children():
-        if isinstance(w, OtpDialog):
+        if isinstance(w, OtpDialog) and hasattr(w, "var"):  # окно может быть ещё не достроено
             result["otp_shown"] = True
             w.var.set("123456")
             w._ok()

@@ -68,6 +68,13 @@ def verify():
         "кнопка Скачать": dlg.btn_ok.winfo_ismapped() and dlg.btn_ok.winfo_height() > 10,
         "список файлов": dlg.panel.tree.winfo_ismapped() and len(dlg.panel.tree.get_children()) == 5,
     }
+    # всё содержимое помещается в окно (на 150–200 % раньше обрезались кнопки)
+    dlg.win.update_idletasks()
+    checks["содержимое помещается по высоте"] = dlg.win.winfo_reqheight() <= dlg.win.winfo_height()
+    checks["содержимое помещается по ширине"] = dlg.win.winfo_reqwidth() <= dlg.win.winfo_width()
+    print(f"окно {dlg.win.winfo_width()}x{dlg.win.winfo_height()}, "
+          f"нужно {dlg.win.winfo_reqwidth()}x{dlg.win.winfo_reqheight()}, "
+          f"DPI {dlg.win.winfo_fpixels('1i'):.0f}")
     for name, cond in checks.items():
         print(("[OK ] " if cond else "[FAIL] ") + name)
         ok = ok and cond
@@ -80,7 +87,9 @@ def verify():
         dlg.win.lift()
         dlg.win.update()
         time.sleep(0.4)
-        img = ImageGrab.grab(bbox=(0, 0, 1500, 1300))
+        w = dlg.win
+        x0, y0 = w.winfo_rootx(), w.winfo_rooty()
+        img = ImageGrab.grab(bbox=(x0, y0, x0 + w.winfo_width(), y0 + w.winfo_height()), all_screens=True)
         out = Path(__file__).resolve().parent / "gui_screenshot.png"
         img.save(out)
         print("screenshot:", out)

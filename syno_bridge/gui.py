@@ -19,7 +19,8 @@ from .config import (load_config, save_config, is_configured,
                      encrypt_password, decrypt_password, remember_destination)
 from .syno_api import SynoClient, SynoError
 from . import registry_win
-from . import theme
+from . import dpi, theme
+from .dpi import px
 from . import updater
 
 log = logging.getLogger("gui")
@@ -120,29 +121,29 @@ class OtpDialog(tk.Toplevel):
             pass
 
         frm = ttk.Frame(self)
-        frm.pack(fill="both", expand=True, padx=18, pady=16)
+        frm.pack(fill="both", expand=True, padx=px(18), pady=px(16))
         ttk.Label(frm, text=message, justify="left").pack(anchor="w")
         self.var = tk.StringVar()
         entry = ttk.Entry(frm, textvariable=self.var, width=14,
                           font=("Segoe UI", 13), justify="center")
-        entry.pack(pady=(10, 12))
+        entry.pack(pady=px(10, 12))
         entry.focus_set()
         entry.bind("<Return>", lambda _e: self._ok())
         btns = ttk.Frame(frm)
         btns.pack()
         theme.flat_button(btns, text="Войти", kind="accent",
-                          command=self._ok).pack(side="left", padx=4)
+                          command=self._ok).pack(side="left", padx=px(4))
         theme.flat_button(btns, text="Отмена",
-                          command=self._cancel).pack(side="left", padx=4)
+                          command=self._cancel).pack(side="left", padx=px(4))
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
         # центрируем над родительским окном
         self.update_idletasks()
         try:
-            px, py = parent.winfo_rootx(), parent.winfo_rooty()
+            rx, ry = parent.winfo_rootx(), parent.winfo_rooty()
             pw, ph = parent.winfo_width(), parent.winfo_height()
-            x = px + max(0, (pw - self.winfo_width()) // 2)
-            y = py + max(0, (ph - self.winfo_height()) // 2)
+            x = rx + max(0, (pw - self.winfo_width()) // 2)
+            y = ry + max(0, (ph - self.winfo_height()) // 2)
             self.geometry(f"+{x}+{y}")
         except tk.TclError:
             pass
@@ -255,7 +256,7 @@ class SettingsDialog(tk.Toplevel):
         band = ttk.Frame(self, style="Band.TFrame")
         band.pack(fill="x")
         inner = ttk.Frame(band, style="Band.TFrame")
-        inner.pack(fill="x", padx=16, pady=12)
+        inner.pack(fill="x", padx=px(16), pady=px(12))
         ttk.Label(inner, text="⚙  Настройки", style="Band.TLabel",
                   font=(theme.FONT, 13, "bold")).pack(anchor="w")
         ttk.Label(inner, text=f"SynoTorrentBridge {__version__}",
@@ -263,8 +264,8 @@ class SettingsDialog(tk.Toplevel):
 
         # карточка подключения
         card = theme.card_frame(self)
-        card.pack(fill="x", padx=10, pady=(10, 5))
-        pad = {"padx": 10, "pady": 4}
+        card.pack(fill="x", padx=px(10), pady=px(10, 5))
+        pad = {"padx": px(10), "pady": px(4)}
         ttk.Label(card, text="Подключение к NAS", style="CardTitle.TLabel").grid(
             row=0, column=0, columnspan=2, sticky="w", **pad)
 
@@ -306,49 +307,49 @@ class SettingsDialog(tk.Toplevel):
 
         # карточка интеграции
         sys_card = theme.card_frame(self)
-        sys_card.pack(fill="x", padx=10, pady=5)
+        sys_card.pack(fill="x", padx=px(10), pady=px(5))
         ttk.Label(sys_card, text="Интеграция с Windows", style="CardTitle.TLabel").pack(
-            anchor="w", padx=10, pady=(10, 2))
+            anchor="w", padx=px(10), pady=px(10, 2))
 
         reg_row = tk.Frame(sys_card, bg=theme.CARD)
-        reg_row.pack(fill="x", padx=10, pady=4)
+        reg_row.pack(fill="x", padx=px(10), pady=px(4))
         self.lbl_reg = ttk.Label(reg_row, style="CardMuted.TLabel")
         self.lbl_reg.pack(side="left")
         theme.flat_button(reg_row, text="Выключить", kind="chip",
-                          command=self._reg_off).pack(side="right", padx=2)
+                          command=self._reg_off).pack(side="right", padx=px(2))
         theme.flat_button(reg_row, text="Включить", kind="chip",
-                          command=self._reg_on).pack(side="right", padx=2)
+                          command=self._reg_on).pack(side="right", padx=px(2))
 
         self.v_notify = tk.BooleanVar(value=registry_win.is_autostart())
         ttk.Checkbutton(sys_card, style="Card.TCheckbutton",
                         text="Уведомлять о завершении закачек (фоновый монитор в автозагрузке)",
                         variable=self.v_notify,
-                        command=self._notify_toggle).pack(anchor="w", padx=10, pady=(2, 10))
+                        command=self._notify_toggle).pack(anchor="w", padx=px(10), pady=px(2, 10))
         self._refresh_reg()
 
         # карточка обновлений
         upd_card = theme.card_frame(self)
-        upd_card.pack(fill="x", padx=10, pady=5)
+        upd_card.pack(fill="x", padx=px(10), pady=px(5))
         ttk.Label(upd_card, text="Обновления", style="CardTitle.TLabel").pack(
-            anchor="w", padx=10, pady=(10, 2))
+            anchor="w", padx=px(10), pady=px(10, 2))
         upd_row = tk.Frame(upd_card, bg=theme.CARD)
-        upd_row.pack(fill="x", padx=10, pady=(2, 10))
+        upd_row.pack(fill="x", padx=px(10), pady=px(2, 10))
         self.lbl_upd = ttk.Label(upd_row, style="CardMuted.TLabel",
                                  text=f"Текущая версия: {__version__}")
         self.lbl_upd.pack(side="left")
         self.btn_upd = theme.flat_button(upd_row, text="Проверить", kind="chip",
                                          command=lambda: self._update_check(manual=True))
-        self.btn_upd.pack(side="right", padx=2)
+        self.btn_upd.pack(side="right", padx=px(2))
         # тихая автопроверка при открытии настроек
         self.after(400, lambda: self._update_check(manual=False))
 
         btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=12, pady=(6, 12))
+        btns.pack(fill="x", padx=px(12), pady=px(6, 12))
         theme.flat_button(btns, text="Проверить подключение",
                           command=self._test).pack(side="left")
         theme.flat_button(btns, text="Отмена", command=self.destroy).pack(side="right")
         theme.flat_button(btns, text="Сохранить", kind="accent",
-                          command=self._save).pack(side="right", padx=8)
+                          command=self._save).pack(side="right", padx=px(8))
 
     def _https_toggled(self):
         """Стандартный порт DSM следует за галочкой HTTPS (5000 ↔ 5001)."""
@@ -550,19 +551,19 @@ class FolderPickerDialog(tk.Toplevel):
         self.client = client
         self.result: str | None = None
         self.title("Папка назначения на NAS")
-        self.geometry("480x420")
-        self.minsize(360, 280)
+        self.geometry(dpi.size(480, 420))
+        self.minsize(*dpi.px(360, 280))
 
         self.tree = ttk.Treeview(self, columns=("path",), displaycolumns=())
-        self.tree.pack(fill="both", expand=True, padx=8, pady=8)
+        self.tree.pack(fill="both", expand=True, padx=px(8), pady=px(8))
         self.tree.bind("<<TreeviewOpen>>", self._on_open)
 
         btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=8, pady=(0, 8))
+        btns.pack(fill="x", padx=px(8), pady=px(0, 8))
         theme.flat_button(btns, text="Новая папка", kind="chip",
                           command=self._mkdir).pack(side="left")
         theme.flat_button(btns, text="Выбрать", kind="accent",
-                          command=self._ok).pack(side="right", padx=4)
+                          command=self._ok).pack(side="right", padx=px(4))
         theme.flat_button(btns, text="Отмена", command=self.destroy).pack(side="right")
 
         self.tree.insert("", "end", iid="__loading__", text="Загрузка…")
@@ -641,14 +642,14 @@ class WaitDialog(tk.Toplevel):
         self.title(title)
         self.resizable(False, False)
         frm = ttk.Frame(self)
-        frm.pack(fill="both", expand=True, padx=16, pady=16)
-        self.lbl = ttk.Label(frm, text=text, wraplength=360)
-        self.lbl.pack(pady=(0, 10))
+        frm.pack(fill="both", expand=True, padx=px(16), pady=px(16))
+        self.lbl = ttk.Label(frm, text=text, wraplength=px(360))
+        self.lbl.pack(pady=px(0, 10))
         self.bar = ttk.Progressbar(frm, mode="indeterminate", length=340)
         self.bar.pack()
         self.bar.start(12)
         theme.flat_button(frm, text="Отмена", kind="chip",
-                          command=self._cancel).pack(pady=(10, 0))
+                          command=self._cancel).pack(pady=px(10, 0))
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         self.grab_set()
 
@@ -679,31 +680,31 @@ class FileSelectPanel(tk.Frame):
         self._sorted = sorted(files, key=lambda x: x.path.lower())
 
         bar = tk.Frame(self, bg=theme.CARD)
-        bar.pack(fill="x", padx=8, pady=(8, 4))
+        bar.pack(fill="x", padx=px(8), pady=px(8, 4))
         ttk.Label(bar, text="Поиск:", style="CardMuted.TLabel").pack(side="left")
         self.v_search = tk.StringVar()
         e = ttk.Entry(bar, textvariable=self.v_search, width=20)
-        e.pack(side="left", padx=(4, 10))
+        e.pack(side="left", padx=px(4, 10))
         e.bind("<KeyRelease>", lambda _e: self._rebuild())
         for text, cmd in (("Все", lambda: self.set_visible(True)),
                           ("Ничего", lambda: self.set_visible(False)),
                           ("Только видео", self.only_video),
                           ("Без субтитров", self.drop_subs)):
             theme.flat_button(bar, text=text, command=cmd, kind="chip",
-                              padx=8, pady=3).pack(side="left", padx=2)
+                              padx=px(8), pady=px(3)).pack(side="left", padx=px(2))
         self.lbl = ttk.Label(bar, text="", style="CardMuted.TLabel")
         self.lbl.pack(side="right")
 
         tree_frm = ttk.Frame(self, style="Card.TFrame")
-        tree_frm.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        tree_frm.pack(fill="both", expand=True, padx=px(8), pady=px(2, 8))
         self.tree = ttk.Treeview(tree_frm, columns=("sel", "size"),
                                  selectmode="extended")
         self.tree.heading("#0", text="Файл")
         self.tree.heading("sel", text="✓")
         self.tree.heading("size", text="Размер")
-        self.tree.column("#0", width=400)
-        self.tree.column("sel", width=34, anchor="center", stretch=False)
-        self.tree.column("size", width=90, anchor="e", stretch=False)
+        self.tree.column("#0", width=px(400))
+        self.tree.column("sel", width=px(34), anchor="center", stretch=False)
+        self.tree.column("size", width=px(90), anchor="e", stretch=False)
         sb = ttk.Scrollbar(tree_frm, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -794,8 +795,8 @@ class AddTorrentDialog:
         self.win = tk.Toplevel(root)
         self.win.configure(bg=theme.BG)
         self.win.title("Добавить загрузку — SynoTorrentBridge")
-        self.win.geometry("700x620")
-        self.win.minsize(560, 480)
+        self.win.geometry(dpi.size(700, 620))
+        self.win.minsize(*dpi.px(560, 480))
         self.win.protocol("WM_DELETE_WINDOW", self._cancel)
 
         self._build()
@@ -808,7 +809,7 @@ class AddTorrentDialog:
         band = ttk.Frame(self.win, style="Band.TFrame")
         band.pack(fill="x")
         inner = ttk.Frame(band, style="Band.TFrame")
-        inner.pack(fill="x", padx=16, pady=12)
+        inner.pack(fill="x", padx=px(16), pady=px(12))
         ttk.Label(inner, text="⬇  Добавить загрузку", style="Band.TLabel",
                   font=(theme.FONT, 13, "bold")).pack(anchor="w")
         title = self.meta.name or "(без имени)"
@@ -820,38 +821,38 @@ class AddTorrentDialog:
         if self.meta.is_magnet:
             parts.append("magnet-ссылка")
         ttk.Label(inner, text=info, style="BandSub.TLabel",
-                  wraplength=620).pack(anchor="w", pady=(2, 0))
+                  wraplength=px(620)).pack(anchor="w", pady=px(2, 0))
         ttk.Label(inner, text="   •   ".join(parts), style="BandSub.TLabel").pack(anchor="w")
 
         # --- файлы (карточка)
         self.can_select = bool(self.meta.files)
         if self.can_select:
             self.panel = FileSelectPanel(self.win, self.meta.files)
-            self.panel.pack(fill="both", expand=True, padx=10, pady=(10, 5))
+            self.panel.pack(fill="both", expand=True, padx=px(10), pady=px(10, 5))
         else:
             card = theme.card_frame(self.win)
-            card.pack(fill="both", expand=True, padx=10, pady=(10, 5))
+            card.pack(fill="both", expand=True, padx=px(10), pady=px(10, 5))
             note = ("Список файлов magnet-ссылки станет известен, когда NAS получит "
                     "метаданные от пиров.")
             if not self.client.supports_file_selection:
                 note += ("\n\nНа вашем NAS недоступен API выбора файлов "
                          "(SYNO.DownloadStation2.Task.BT.File) — торрент будет скачан целиком.")
-            ttk.Label(card, text=note, style="Card.TLabel", wraplength=580,
-                      justify="left").pack(padx=14, pady=(16, 8), anchor="w")
+            ttk.Label(card, text=note, style="Card.TLabel", wraplength=px(580),
+                      justify="left").pack(padx=px(14), pady=px(16, 8), anchor="w")
             self.v_pick_later = tk.BooleanVar(value=self.client.supports_file_selection)
             if self.client.supports_file_selection:
                 ttk.Checkbutton(
                     card, style="Card.TCheckbutton",
                     text="Выбрать файлы после получения метаданных (NAS сначала получит список)",
-                    variable=self.v_pick_later).pack(padx=14, pady=(0, 14), anchor="w")
+                    variable=self.v_pick_later).pack(padx=px(14), pady=px(0, 14), anchor="w")
 
         # --- папка назначения (карточка)
         dest_card = theme.card_frame(self.win)
-        dest_card.pack(fill="x", padx=10, pady=5)
+        dest_card.pack(fill="x", padx=px(10), pady=px(5))
         ttk.Label(dest_card, text="Папка назначения на NAS",
-                  style="CardTitle.TLabel").pack(anchor="w", padx=12, pady=(10, 4))
+                  style="CardTitle.TLabel").pack(anchor="w", padx=px(12), pady=px(10, 4))
         row = tk.Frame(dest_card, bg=theme.CARD)
-        row.pack(fill="x", padx=12, pady=(0, 10))
+        row.pack(fill="x", padx=px(12), pady=px(0, 10))
         recent = self.cfg.get("recent_destinations", [])
         default_dest = self.cfg.get("last_destination") or ""
         self.v_dest = tk.StringVar(value=default_dest)
@@ -859,17 +860,17 @@ class AddTorrentDialog:
                                      values=recent, width=52)
         self.cmb_dest.pack(side="left", fill="x", expand=True)
         theme.flat_button(row, text="Обзор…", kind="chip",
-                          command=self._browse).pack(side="left", padx=(6, 0))
+                          command=self._browse).pack(side="left", padx=px(6, 0))
 
         # --- кнопки
         btns = ttk.Frame(self.win)
-        btns.pack(fill="x", padx=12, pady=(6, 12))
+        btns.pack(fill="x", padx=px(12), pady=px(6, 12))
         self.lbl_status = ttk.Label(btns, text="", style="Muted.TLabel")
         self.lbl_status.pack(side="left")
         theme.flat_button(btns, text="Отмена", command=self._cancel).pack(side="right")
         self.btn_ok = theme.flat_button(btns, text="Скачать", kind="accent",
                                         command=self._submit)
-        self.btn_ok.pack(side="right", padx=8)
+        self.btn_ok.pack(side="right", padx=px(8))
 
     # ---------- файлы ----------
 
@@ -1362,28 +1363,28 @@ class MagnetFilesDialog:
         self.win = tk.Toplevel(root)
         self.win.configure(bg=theme.BG)
         self.win.title("Выбор файлов — magnet")
-        self.win.geometry("660x540")
+        self.win.geometry(dpi.size(660, 540))
         self.meta = meta
 
         band = ttk.Frame(self.win, style="Band.TFrame")
         band.pack(fill="x")
         inner = ttk.Frame(band, style="Band.TFrame")
-        inner.pack(fill="x", padx=16, pady=12)
+        inner.pack(fill="x", padx=px(16), pady=px(12))
         ttk.Label(inner, text="⬇  Выбор файлов", style="Band.TLabel",
                   font=(theme.FONT, 13, "bold")).pack(anchor="w")
         ttk.Label(inner, text=meta.name, style="BandSub.TLabel",
-                  wraplength=620).pack(anchor="w", pady=(2, 0))
+                  wraplength=px(620)).pack(anchor="w", pady=px(2, 0))
         ttk.Label(inner, text=f"файлов: {len(meta.files)}   •   {human_size(meta.total_size)}",
                   style="BandSub.TLabel").pack(anchor="w")
 
         self.panel = FileSelectPanel(self.win, meta.files)
-        self.panel.pack(fill="both", expand=True, padx=10, pady=(10, 5))
+        self.panel.pack(fill="both", expand=True, padx=px(10), pady=px(10, 5))
 
         btns = ttk.Frame(self.win)
-        btns.pack(fill="x", padx=12, pady=(6, 12))
+        btns.pack(fill="x", padx=px(12), pady=px(6, 12))
         theme.flat_button(btns, text="Отмена", command=self._cancel).pack(side="right")
         theme.flat_button(btns, text="Скачать выбранные", kind="accent",
-                          command=self._ok).pack(side="right", padx=8)
+                          command=self._ok).pack(side="right", padx=px(8))
         self.win.protocol("WM_DELETE_WINDOW", self._cancel)
         self.win.grab_set()
 
@@ -1445,13 +1446,9 @@ class MagnetFilesDialog:
 # ------------------------------------------------------------------ запуск
 
 def setup_root() -> tk.Tk:
+    dpi.enable()  # до tk.Tk(), иначе на 4K всё мелкое
     root = tk.Tk()
     root.withdraw()
-    try:
-        from ctypes import windll
-        windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
     theme.apply_theme(root)
     return root
 

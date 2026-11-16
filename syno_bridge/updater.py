@@ -32,7 +32,7 @@ import tempfile
 import time
 import urllib.request
 
-from . import __version__, GITHUB_REPO, winsync
+from . import __version__, GITHUB_REPO, tls, winsync
 
 log = logging.getLogger("updater")
 
@@ -64,7 +64,7 @@ def check_latest(repo: str = GITHUB_REPO, timeout: int = 15) -> dict | None:
         return None
     req = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/releases/latest", headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=tls.verified_context()) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     tag = data.get("tag_name", "")
     if parse_version(tag) <= parse_version(__version__):
@@ -92,7 +92,7 @@ def download(url: str, dst: str, timeout: int = 300, sha256: str = "",
     удаляется и бросается OSError — такой exe никогда не запускается."""
     req = urllib.request.Request(url, headers=UA)
     h = hashlib.sha256()
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dst, "wb") as f:
+    with urllib.request.urlopen(req, timeout=timeout, context=tls.verified_context()) as resp, open(dst, "wb") as f:
         while True:
             chunk = resp.read(1 << 16)
             if not chunk:

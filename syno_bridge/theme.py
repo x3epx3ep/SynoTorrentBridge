@@ -5,6 +5,9 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+from . import dpi
+from .dpi import px
+
 # палитра
 BG = "#f4f6fb"          # фон окон
 CARD = "#ffffff"        # карточки
@@ -38,11 +41,11 @@ def flat_button(parent, text: str, command=None, kind: str = "normal",
     b = tk.Button(parent, text=text, command=command, bg=bg, fg=fg,
                   activebackground=hbg, activeforeground=hfg,
                   disabledforeground=MUTED, relief="flat", bd=0,
-                  padx=padx, pady=pady, cursor="hand2",
+                  padx=px(padx), pady=px(pady), cursor="hand2",
                   font=(FONT, 9, "bold" if bold else "normal"),
                   highlightthickness=1, highlightbackground=BORDER)
     if kind == "accent":
-        b.configure(highlightthickness=0, padx=padx + 1, pady=pady + 1)
+        b.configure(highlightthickness=0, padx=px(padx + 1), pady=px(pady + 1))
     if width:
         b.configure(width=width)
     b.bind("<Enter>", lambda _e: b.config(bg=hbg, fg=hfg))
@@ -61,6 +64,7 @@ def card_frame(parent, **pack_kw) -> tk.Frame:
 
 def apply_theme(root: tk.Misc) -> None:
     """Настраивает ttk-стили и фон. Вызывать один раз на root."""
+    dpi.init(root)
     style = ttk.Style(root)
     try:
         style.theme_use("vista")
@@ -85,30 +89,30 @@ def apply_theme(root: tk.Misc) -> None:
     style.configure("Ok.TLabel", foreground=OK)
     style.configure("Err.TLabel", foreground=DANGER)
 
-    style.configure("TButton", padding=(12, 6), background=CARD)
+    style.configure("TButton", padding=px(12, 6), background=CARD)
     style.map("TButton",
               background=[("active", SEL_BG), ("pressed", BORDER)])
-    style.configure("Accent.TButton", padding=(16, 7), background=ACCENT,
+    style.configure("Accent.TButton", padding=px(16, 7), background=ACCENT,
                     foreground="#ffffff", font=(FONT, 9, "bold"))
     style.map("Accent.TButton",
               background=[("active", ACCENT_DARK), ("pressed", ACCENT_DARK),
                           ("disabled", BORDER)],
               foreground=[("disabled", MUTED)])
-    style.configure("Danger.TButton", padding=(12, 6), foreground=DANGER)
+    style.configure("Danger.TButton", padding=px(12, 6), foreground=DANGER)
 
     style.configure("TCheckbutton", background=BG)
     style.configure("Card.TCheckbutton", background=CARD)
-    style.configure("TEntry", padding=4)
-    style.configure("TCombobox", padding=4)
+    style.configure("TEntry", padding=px(4))
+    style.configure("TCombobox", padding=px(4))
 
     style.configure("TLabelframe", background=BG, bordercolor=BORDER)
     style.configure("TLabelframe.Label", background=BG, foreground=MUTED)
 
     style.configure("Treeview", background=CARD, fieldbackground=CARD,
-                    foreground=TEXT, rowheight=24, bordercolor=BORDER,
+                    foreground=TEXT, rowheight=px(24), bordercolor=BORDER,
                     lightcolor=BORDER, darkcolor=BORDER)
     style.configure("Treeview.Heading", font=(FONT, 9, "bold"),
-                    background=BG, foreground=MUTED, padding=(6, 4))
+                    background=BG, foreground=MUTED, padding=px(6, 4))
     style.map("Treeview",
               background=[("selected", SEL_BG)],
               foreground=[("selected", TEXT)])

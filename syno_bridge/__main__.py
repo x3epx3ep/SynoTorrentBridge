@@ -67,6 +67,8 @@ def _housekeeping(repair: bool) -> None:
 
 
 def main(argv: list | None = None) -> int:
+    from . import dpi
+    dpi.enable()  # до любого tk.Tk(): иначе на экранах 150–200 % интерфейс мелкий
     _setup_logging()
     args = list(sys.argv[1:] if argv is None else argv)
     log = logging.getLogger("main")

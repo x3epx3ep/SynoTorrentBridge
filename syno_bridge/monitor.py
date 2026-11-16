@@ -13,6 +13,7 @@ import logging
 import tkinter as tk
 
 from . import theme, winsync
+from .dpi import px
 from .config import APP_DIR, load_config, is_configured
 from .syno_api import SynoError, DS2_FINISHED
 
@@ -47,18 +48,18 @@ def show_toast(root: tk.Tk, title: str, text: str, timeout_ms: int = 9000) -> No
     top.attributes("-topmost", True)
     top.configure(bg=theme.CARD, highlightbackground=theme.BORDER,
                   highlightthickness=1)
-    tk.Frame(top, bg=theme.ACCENT, width=4).pack(side="left", fill="y")
+    tk.Frame(top, bg=theme.ACCENT, width=px(4)).pack(side="left", fill="y")
     body = tk.Frame(top, bg=theme.CARD)
-    body.pack(side="left", fill="both", expand=True, padx=12, pady=10)
+    body.pack(side="left", fill="both", expand=True, padx=px(12), pady=px(10))
     tk.Label(body, text=title, bg=theme.CARD, fg=theme.TEXT,
              font=(theme.FONT, 10, "bold")).pack(anchor="w")
     tk.Label(body, text=text, bg=theme.CARD, fg=theme.MUTED,
-             font=(theme.FONT, 9), wraplength=320,
-             justify="left").pack(anchor="w", pady=(2, 0))
+             font=(theme.FONT, 9), wraplength=px(320),
+             justify="left").pack(anchor="w", pady=px(2, 0))
     top.update_idletasks()
     w, h = top.winfo_width(), top.winfo_height()
-    x = top.winfo_screenwidth() - w - 16
-    y = top.winfo_screenheight() - h - 64
+    x = top.winfo_screenwidth() - w - px(16)
+    y = top.winfo_screenheight() - h - px(64)
     top.geometry(f"+{x}+{y}")
     for wgt in (top, body, *body.winfo_children()):
         wgt.bind("<Button-1>", lambda _e: top.destroy())

@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -772,6 +773,68 @@ def test_uninstall_delete():
 
 # ------------------------------------------------------------- журнал
 
+def test_tls():
+    import ssl
+    from syno_bridge import tls
+    from syno_bridge.syno_api import SynoClient
+    check("tls: проверка через хранилище Windows", tls.backend() == "windows", tls.backend())
+    ctx = tls.verified_context()
+    check("tls: проверка включена", ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname)
+    c = SynoClient("nas.example.ru", 5001, True, verify_ssl=True)
+    h = [x for x in c._opener.handlers if isinstance(x, urllib.request.HTTPSHandler)]
+    check("tls: клиент с проверкой использует контекст Windows",
+          h and type(h[0]._context).__module__.startswith("truststore"), str(h))
+    c = SynoClient("nas.example.ru", 5001, True, verify_ssl=False)
+    h = [x for x in c._opener.handlers if isinstance(x, urllib.request.HTTPSHandler)]
+    check("tls: без проверки — CERT_NONE", h and h[0]._context.verify_mode == ssl.CERT_NONE)
+
+    def err(code):
+        e = ssl.SSLCertVerificationError("x")
+        e.verify_code = code
+        return e
+    check("tls: IP вместо имени", "по IP" in tls.cert_hint(err(tls.CERT_E_CN_NO_MATCH), "192.168.0.100"))
+    check("tls: IP вместо имени (OpenSSL)",
+          "по IP" in tls.cert_hint(err(tls.X509_V_ERR_IP_ADDRESS_MISMATCH), "10.0.0.5"))
+    check("tls: чужое имя", "nas.lan" in tls.cert_hint(err(-2146762481), "nas.lan"))  # 0x800B010F со знаком
+    check("tls: истёк", "истёк" in tls.cert_hint(err(tls.CERT_E_EXPIRED), "nas.lan"))
+    check("tls: самоподписанный",
+          "самоподписанный" in tls.cert_hint(err(tls.CERT_E_UNTRUSTEDROOT), "nas.lan"))
+    e = ssl.SSLCertVerificationError("Имя не совпадает")
+    check("tls: текст ошибки без кортежа", tls.describe(e) == "Имя не совпадает", tls.describe(e))
+    check("tls: не сертификат", tls.cert_hint(ConnectionRefusedError(10061, "x"), "nas.lan") == "")
+
+
+def test_dpi():
+    from syno_bridge import dpi
+    old = dpi._factor
+    try:
+        dpi._factor = 2.0
+        check("dpi: px(10) при 200 %", dpi.px(10) == 20)
+        check("dpi: px(10, 5) при 200 %", dpi.px(10, 5) == (20, 10))
+        check("dpi: px((6, 4))", dpi.px((6, 4)) == (12, 8))
+        check("dpi: размер окна", dpi.size(700, 620) == "1400x1240")
+        dpi._factor = 1.5
+        check("dpi: 150 % округляется", dpi.px(5) == 8 and dpi.px(18) == 27)
+
+        class FakeRoot:
+            def __init__(self, ppi): self.ppi = ppi
+            def winfo_fpixels(self, _): return self.ppi
+        check("dpi: 4K 200 %", dpi.init(FakeRoot(192.0)) == 2.0)
+        check("dpi: 96 DPI — без масштаба", dpi.init(FakeRoot(96.0)) == 1.0)
+        check("dpi: меньше 96 не уменьшает", dpi.init(FakeRoot(72.0)) == 1.0)
+    finally:
+        dpi._factor = old
+    # порядок запуска: DPI-режим включается до первого tk.Tk()
+    src = (ROOT / "syno_bridge" / "__main__.py").read_text(encoding="utf-8")
+    m = src.index("def main(")
+    check("dpi: main() включает DPI-режим первым делом",
+          "dpi.enable()" in src[m:m + 300])
+    g = (ROOT / "syno_bridge" / "gui.py").read_text(encoding="utf-8")
+    sr = g[g.index("def setup_root"):]
+    check("dpi: setup_root — enable() до tk.Tk()",
+          sr.index("dpi.enable()") < sr.index("tk.Tk()"))
+
+
 def test_log_rotation():
     import syno_bridge.__main__ as m
     tmp = Path(tempfile.mkdtemp(prefix="syno_log_test_"))
@@ -805,6 +868,8 @@ if __name__ == "__main__":
     test_registry()
     test_uninstall_delete()
     test_log_rotation()
+    test_tls()
+    test_dpi()
     print()
     if FAILED:
         print(f"ПРОВАЛЕНО: {len(FAILED)}: {FAILED}")

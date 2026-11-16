@@ -38,7 +38,7 @@ dlg = SettingsDialog(root)
 def watch():
     for parent in (root, dlg):
         for w in parent.winfo_children():
-            if isinstance(w, OtpDialog):
+            if isinstance(w, OtpDialog) and hasattr(w, "var"):  # окно может быть ещё не достроено
                 result["otp_shown"] = True
                 w.var.set("123456")
                 w._ok()

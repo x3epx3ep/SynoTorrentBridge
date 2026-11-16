@@ -27,6 +27,7 @@ SynoTorrentBridge was built to fix exactly that.
 - **Completion notifications** — an optional background monitor shows a toast when a download finishes, including tasks that go straight to seeding.
 - **Auto-update** — checks GitHub Releases from the settings dialog, verifies the download against the **SHA-256 published by GitHub**, and replaces itself even while the background monitor is running (the monitor is restarted afterwards).
 - **Self-healing paths** — if you move the exe or download it again as `SynoTorrentBridge (2).exe`, the handlers, autostart and "Apps" entry are re-pointed to the copy you started.
+- **Sharp on 4K / high-DPI screens** — the window follows Windows display scaling.
 - **Single .exe, no dependencies** — no Python, no installation required.
 - **Clean uninstall** — appears in Windows "Apps & Features"; uninstall stops the monitor, removes handlers (restoring previous ones), autostart, optionally settings, and the exe itself.
 
@@ -64,10 +65,10 @@ SynoTorrentBridge.exe --uninstall          remove everything
 
 ## Building from source
 
-Requires Python 3.10+ (standard library only), plus PyInstaller and Pillow for packaging:
+Requires Python 3.10+. The only runtime dependency is optional — [truststore](https://pypi.org/project/truststore/) (certificate checks through the Windows certificate store, like a browser); packaging also needs PyInstaller and Pillow:
 
 ```
-python -m pip install pyinstaller pillow
+python -m pip install truststore pyinstaller pillow
 build_exe.bat
 ```
 
@@ -89,7 +90,9 @@ Tests never touch the real handlers, settings or a running monitor: they use the
 
 ## Tech notes
 
-- Pure standard library: `tkinter` GUI, `urllib` HTTP, `winreg`/`ctypes` for Windows integration.
+- Standard library plus `truststore`: `tkinter` GUI, `urllib` HTTP, `winreg`/`ctypes` for Windows integration.
+- HTTPS certificates are verified by Windows itself (via `truststore`), so a certificate your browser trusts — e.g. a Let's Encrypt wildcard on `dsm.example.com` — is trusted here too, even if Windows hasn't downloaded its root yet.
+- DPI-aware: the UI scales with Windows display scaling (125–200 %, 4K).
 - Talks to Download Station via the DSM 7 Web API (`SYNO.DownloadStation2.*`): `Task create` with `create_list`, `Task.List`, `Task.List.Polling download` with `selected=[...]`, `Task.BT.File list/set` for magnets. Task status `5` = finished, `8` = finished and seeding.
 - Tested on Windows 10/11 with DSM 7.x / Download Station 4.x.
 

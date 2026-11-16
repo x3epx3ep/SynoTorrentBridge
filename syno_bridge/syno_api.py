@@ -12,12 +12,13 @@ import http.client
 import http.cookiejar
 import json
 import logging
-import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+
+from . import tls
 
 log = logging.getLogger("syno_api")
 
@@ -76,6 +77,7 @@ class SynoClient:
                  username: str = "", password: str = "", otp_code: str = "", timeout: int = 30,
                  device_id: str = "", device_name: str = "SynoTorrentBridge"):
         scheme = "https" if use_https else "http"
+        self.host = host
         self.base = f"{scheme}://{host}:{int(port)}"
         self.username = username
         self.password = password
@@ -89,10 +91,8 @@ class SynoClient:
         # и автоматически шлём обратно при следующих входах
         self._cookies = http.cookiejar.CookieJar()
         handlers = [urllib.request.HTTPCookieProcessor(self._cookies)]
-        if use_https and not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+        if use_https:
+            ctx = tls.verified_context() if verify_ssl else tls.unverified_context()
             handlers.append(urllib.request.HTTPSHandler(context=ctx))
         self._opener = urllib.request.build_opener(*handlers)
 
@@ -136,9 +136,11 @@ class SynoClient:
                 hint = " (адрес не найден — проверьте имя/IP NAS)"
             elif "timed out" in text or "10060" in text:
                 hint = " (тайм-аут — NAS недоступен по сети или порт закрыт брандмауэром)"
-            elif "certificate" in text.lower() or "SSL" in text:
-                hint = " (проблема SSL-сертификата — снимите галочку «Проверять SSL-сертификат»)"
-            raise SynoError(f"NAS недоступен ({self.base}): {reason}{hint}") from e
+            elif tls.cert_hint(reason, self.host):
+                hint = " — " + tls.cert_hint(reason, self.host)
+            elif "SSL" in text:
+                hint = " (ошибка SSL — проверьте, что на этом порту включён HTTPS)"
+            raise SynoError(f"NAS недоступен ({self.base}): {tls.describe(reason)}{hint}") from e
         except TimeoutError as e:
             # тайм-аут на чтении ответа приходит не как URLError, а напрямую
             raise SynoError(f"NAS не ответил вовремя ({self.base}): тайм-аут "
