@@ -6,9 +6,16 @@
 Let's Encrypt как надёжный, а Python на той же машине может ругаться
 «unable to get local issuer certificate», пока корень ни разу не скачивался.
 
-truststore проверяет цепочку штатным механизмом Windows (CertGetCertificateChain),
-так что результат совпадает с браузером. Если пакета нет (запуск из исходников
-без него) — обычный ssl.create_default_context().
+Поэтому проверка идёт в два шага:
+1. truststore — штатный механизм Windows (CertGetCertificateChain): видит
+   корпоративные и вручную установленные корни, докачивает недостающие.
+2. Если Windows ответила «корень не доверенный» (на компьютерах, где групповая
+   политика отключает автообновление корней, ISRG Root X1 так и не появляется),
+   повторная проверка OpenSSL по объединённому списку: хранилище Windows +
+   список доверенных центров Mozilla (пакет certifi — тот же, что у Firefox).
+   Chrome и Edge тоже не зависят от хранилища Windows — у них свой список,
+   поэтому браузер такой сертификат принимает.
+Самоподписанный сертификат или чужое имя не проходит ни на одном шаге.
 """
 
 from __future__ import annotations
@@ -55,6 +62,35 @@ def verified_context() -> ssl.SSLContext:
             log.info("truststore недоступен (%s) — проверка сертификатов средствами OpenSSL", e)
         _backend = "openssl"
         return ssl.create_default_context()
+
+
+def fallback_context() -> ssl.SSLContext:
+    """Запасная проверка: хранилище Windows + список Mozilla (certifi)."""
+    ctx = ssl.create_default_context()  # на Windows подгружает ROOT и CA из хранилища
+    try:
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+    except Exception as e:  # noqa: BLE001
+        log.info("certifi недоступен (%s) — запасная проверка только по хранилищу Windows", e)
+    return ctx
+
+
+def is_cert_error(err) -> bool:
+    return isinstance(err, ssl.SSLCertVerificationError)
+
+
+def urlopen(req, timeout: float):
+    """urllib.request.urlopen с проверкой сертификата в два шага (см. выше)."""
+    import urllib.error
+    import urllib.request
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=verified_context())
+    except urllib.error.URLError as e:
+        if not is_cert_error(getattr(e, "reason", None)):
+            raise
+        log.info("Windows не подтвердила сертификат (%s) — проверка по списку Mozilla",
+                 describe(e.reason))
+        return urllib.request.urlopen(req, timeout=timeout, context=fallback_context())
 
 
 def unverified_context() -> ssl.SSLContext:

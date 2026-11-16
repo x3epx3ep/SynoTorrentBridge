@@ -90,9 +90,18 @@ class SynoClient:
         # cookie-jar: DSM отдаёт device id (did) cookie'ой — ловим и её тоже,
         # и автоматически шлём обратно при следующих входах
         self._cookies = http.cookiejar.CookieJar()
-        handlers = [urllib.request.HTTPCookieProcessor(self._cookies)]
+        self._use_https = use_https
+        self._verify = verify_ssl
+        self._tls_fallback = False
         if use_https:
             ctx = tls.verified_context() if verify_ssl else tls.unverified_context()
+        else:
+            ctx = None
+        self._build_opener(ctx)
+
+    def _build_opener(self, ctx) -> None:
+        handlers = [urllib.request.HTTPCookieProcessor(self._cookies)]
+        if ctx is not None:
             handlers.append(urllib.request.HTTPSHandler(context=ctx))
         self._opener = urllib.request.build_opener(*handlers)
 
@@ -128,6 +137,16 @@ class SynoClient:
             raise SynoError(f"HTTP Error {e.code}: {e.reason}") from e
         except urllib.error.URLError as e:
             reason = getattr(e, "reason", e)
+            if (self._use_https and self._verify and not self._tls_fallback
+                    and tls.is_cert_error(reason)):
+                # Windows не подтвердила цепочку (часто: автообновление корней
+                # отключено политикой) — повторяем по списку Mozilla, один раз
+                log.info("Windows не подтвердила сертификат %s (%s) — проверка по списку Mozilla",
+                         self.host, tls.describe(reason))
+                self._tls_fallback = True
+                self._build_opener(tls.fallback_context())
+                return self._request(path, params=params, post=post,
+                                     raw_body=raw_body, headers=headers)
             hint = ""
             text = str(reason)
             if "10061" in text or "Connection refused" in text:

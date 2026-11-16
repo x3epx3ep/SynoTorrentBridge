@@ -266,6 +266,7 @@ class SettingsDialog(tk.Toplevel):
         card = theme.card_frame(self)
         card.pack(fill="x", padx=px(10), pady=px(10, 5))
         pad = {"padx": px(10), "pady": px(4)}
+        card.columnconfigure(1, weight=1)  # лишняя ширина — полям, а не колонке подписей
         ttk.Label(card, text="Подключение к NAS", style="CardTitle.TLabel").grid(
             row=0, column=0, columnspan=2, sticky="w", **pad)
 
@@ -302,7 +303,9 @@ class SettingsDialog(tk.Toplevel):
 
         ttk.Label(card, text="Если на NAS включена 2FA — код будет запрошен автоматически.",
                   style="CardMuted.TLabel").grid(row=7, column=0, columnspan=2, sticky="w", **pad)
-        self.lbl_status = ttk.Label(card, text="", style="CardMuted.TLabel")
+        # перенос строк обязателен: длинная ошибка иначе растягивает окно на весь экран
+        self.lbl_status = ttk.Label(card, text="", style="CardMuted.TLabel",
+                                    wraplength=px(440), justify="left")
         self.lbl_status.grid(row=8, column=0, columnspan=2, sticky="w", **pad)
 
         # карточка интеграции
@@ -865,7 +868,8 @@ class AddTorrentDialog:
         # --- кнопки
         btns = ttk.Frame(self.win)
         btns.pack(fill="x", padx=px(12), pady=px(6, 12))
-        self.lbl_status = ttk.Label(btns, text="", style="Muted.TLabel")
+        self.lbl_status = ttk.Label(btns, text="", style="Muted.TLabel",
+                                    wraplength=px(360), justify="left")
         self.lbl_status.pack(side="left")
         theme.flat_button(btns, text="Отмена", command=self._cancel).pack(side="right")
         self.btn_ok = theme.flat_button(btns, text="Скачать", kind="accent",

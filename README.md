@@ -65,10 +65,10 @@ SynoTorrentBridge.exe --uninstall          remove everything
 
 ## Building from source
 
-Requires Python 3.10+. The only runtime dependency is optional — [truststore](https://pypi.org/project/truststore/) (certificate checks through the Windows certificate store, like a browser); packaging also needs PyInstaller and Pillow:
+Requires Python 3.10+. Two optional runtime dependencies for certificate checks: [truststore](https://pypi.org/project/truststore/) (verification by Windows itself) and [certifi](https://pypi.org/project/certifi/) (Mozilla's CA list as a fallback); packaging also needs PyInstaller and Pillow:
 
 ```
-python -m pip install truststore pyinstaller pillow
+python -m pip install truststore certifi pyinstaller pillow
 build_exe.bat
 ```
 
@@ -80,6 +80,7 @@ The result is `dist\SynoTorrentBridge.exe` (version info embedded; the script pr
 python tests\test_all.py          parser, API client vs mock NAS, monitor, updater, registry, uninstall, log
 python tests\gui_smoke.py         dialog layout
 python tests\gui_flow_test.py     add-torrent dialog flow (empty selection, missing folder, task creation)
+python tests\tls_fallback_test.py   certificate fallback (local HTTPS with a throwaway CA)
 python tests\magnet_select_test.py  magnet file selection never leaves zero wanted files
 python tests\otp_flow_test.py     2FA prompt
 python tests\e2e_live.py          read-only check against YOUR configured NAS (nothing is downloaded)
@@ -90,8 +91,8 @@ Tests never touch the real handlers, settings or a running monitor: they use the
 
 ## Tech notes
 
-- Standard library plus `truststore`: `tkinter` GUI, `urllib` HTTP, `winreg`/`ctypes` for Windows integration.
-- HTTPS certificates are verified by Windows itself (via `truststore`), so a certificate your browser trusts — e.g. a Let's Encrypt wildcard on `dsm.example.com` — is trusted here too, even if Windows hasn't downloaded its root yet.
+- Standard library plus `truststore` and `certifi`: `tkinter` GUI, `urllib` HTTP, `winreg`/`ctypes` for Windows integration.
+- HTTPS certificates are verified by Windows itself (via `truststore`), so corporate and manually installed roots work and missing roots are downloaded on demand. If Windows still reports an untrusted root (e.g. root auto-update disabled by group policy — Chrome and Edge don't notice, they ship their own CA list), the check is repeated against the Windows store plus Mozilla's CA list (`certifi`). A publicly trusted certificate such as a Let's Encrypt wildcard on `dsm.example.com` is therefore accepted; self-signed certificates and wrong host names are still rejected.
 - DPI-aware: the UI scales with Windows display scaling (125–200 %, 4K).
 - Talks to Download Station via the DSM 7 Web API (`SYNO.DownloadStation2.*`): `Task create` with `create_list`, `Task.List`, `Task.List.Polling download` with `selected=[...]`, `Task.BT.File list/set` for magnets. Task status `5` = finished, `8` = finished and seeding.
 - Tested on Windows 10/11 with DSM 7.x / Download Station 4.x.
